@@ -1,0 +1,285 @@
+From 8748b2694c733eeea7ec682e395f450777cbe498 Mon Sep 17 00:00:00 2001
+From: ahdiotllfer <ahdiotllfer@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 09:34:24 +0000
+Subject: [PATCH] hid: multi-touch touchscreen protocol over virtio-input
+Adds hid_touchscreen_t with type-B MT evdev semantics (ABS_MT_SLOT,
+ABS_MT_TRACKING_ID, ABS_MT_POSITION_X/Y, BTN_TOUCH) and the matching
+virtio-input config space (EV_BITS/ABS_INFO) so guest kernels (and
+libinput) probe a proper multi-touch panel. Up to 10 concurrent contacts.
+---
+ src/devices/hid_api.h      |  16 ++++
+ src/devices/virtio-input.c | 150 +++++++++++++++++++++++++++++++++++--
+ 2 files changed, 159 insertions(+), 7 deletions(-)
+
+diff --git a/src/devices/hid_api.h b/src/devices/hid_api.h
+index ebe1d41..60688e6 100644
+--- a/src/devices/hid_api.h
++++ b/src/devices/hid_api.h
+@@ -23,6 +23,7 @@ typedef struct hid_keyboard hid_keyboard_t;
+ 
+ //! HID Mouse handle
+ typedef struct hid_mouse    hid_mouse_t;
++typedef struct hid_touchscreen hid_touchscreen_t;
+ 
+ //! \brief   Attach a HID keyboard to the machine
+ //! \warning After rvvm_machine_free(), keyboard handle is no longer valid
+@@ -64,6 +65,21 @@ PUBLIC void hid_mouse_move_virtio(hid_mouse_t* mouse, int32_t x, int32_t y);
+ //! \brief Place mouse (absolute) on the virtio-input mouse device
+ PUBLIC void hid_mouse_place_virtio(hid_mouse_t* mouse, int32_t x, int32_t y);
+ 
++//! \brief Attach a HID multi-touch touchscreen via virtio-input
++PUBLIC hid_touchscreen_t* hid_touchscreen_init_auto_virtio(rvvm_machine_t* machine);
++
++//! \brief Set touchscreen resolution in guest pixels
++PUBLIC void hid_touchscreen_resolution_virtio(hid_touchscreen_t* ts, uint32_t width, uint32_t height);
++
++//! \brief Touch contact began at (x, y) in guest pixels; tracking_id is stable per finger
++PUBLIC void hid_touch_down_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id, int32_t x, int32_t y);
++
++//! \brief Touch contact moved
++PUBLIC void hid_touch_move_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id, int32_t x, int32_t y);
++
++//! \brief Touch contact ended
++PUBLIC void hid_touch_up_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id);
++
+ 
+ //! \brief Press a keyboard key
+ PUBLIC void hid_keyboard_press(hid_keyboard_t* kb, hid_key_t key);
+diff --git a/src/devices/virtio-input.c b/src/devices/virtio-input.c
+index e558bc3..fe4c023 100644
+--- a/src/devices/virtio-input.c
++++ b/src/devices/virtio-input.c
+@@ -90,6 +90,12 @@ enum {
+ enum {
+     ABS_X = 0,
+     ABS_Y = 1,
++    ABS_MT_SLOT        = 0x2f,
++    ABS_MT_TOUCH_MAJOR = 0x30,
++    ABS_MT_POSITION_X  = 0x35,
++    ABS_MT_POSITION_Y  = 0x36,
++    ABS_MT_TRACKING_ID = 0x39,
++    BTN_TOUCH          = 0x14a,
+ };
+ 
+ enum {
+@@ -190,6 +196,7 @@ typedef struct {
+     uint16_t height;
+ 
+     uint8_t is_keyboard;
++    uint8_t is_touch;
+ 
+     virtio_input_event_t pending[256];
+     uint16_t pending_head;
+@@ -206,6 +213,15 @@ struct hid_mouse {
+     uint32_t abs_y;
+ };
+ 
++#define HID_TOUCH_SLOTS 10
++
++struct hid_touchscreen {
++    virtio_input_dev_t* dev;
++    uint16_t width;
++    uint16_t height;
++    uint32_t tracking[HID_TOUCH_SLOTS];
++};
++
+ static inline uint32_t mmio_load_u32(const void* data, uint8_t size)
+ {
+     if (size == 1) {
+@@ -528,7 +544,7 @@ static void virtio_input_update_cfg(virtio_input_dev_t* v)
+     memset(v->cfg.u.bitmap, 0, sizeof(v->cfg.u.bitmap));
+ 
+     if (sel == VIRTIO_INPUT_CFG_ID_NAME) {
+-        const char* s = v->is_keyboard ? "virtio-input-keyboard" : "virtio-input-mouse";
++        const char* s = v->is_keyboard ? "virtio-input-keyboard" : (v->is_touch ? "virtio-input-touchscreen" : "virtio-input-mouse");
+         size_t n = strlen(s);
+         if (n >= sizeof(v->cfg.u.string)) {
+             n = sizeof(v->cfg.u.string) - 1;
+@@ -568,6 +584,9 @@ static void virtio_input_update_cfg(virtio_input_dev_t* v)
+         if (sub == 0) {
+             if (v->is_keyboard) {
+                 bitmap_set(v->cfg.u.bitmap, EV_KEY);
++            } else if (v->is_touch) {
++                bitmap_set(v->cfg.u.bitmap, EV_KEY);
++                bitmap_set(v->cfg.u.bitmap, EV_ABS);
+             } else {
+                 bitmap_set(v->cfg.u.bitmap, EV_KEY);
+                 bitmap_set(v->cfg.u.bitmap, EV_REL);
+@@ -576,6 +595,26 @@ static void virtio_input_update_cfg(virtio_input_dev_t* v)
+             return;
+         }
+ 
++        if (v->is_touch) {
++            if (sub == EV_KEY) {
++                bitmap_set(v->cfg.u.bitmap, BTN_TOUCH);
++                v->cfg.size = bitmap_min_size(v->cfg.u.bitmap, sizeof(v->cfg.u.bitmap));
++                return;
++            }
++            if (sub == EV_ABS) {
++                bitmap_set(v->cfg.u.bitmap, ABS_X);
++                bitmap_set(v->cfg.u.bitmap, ABS_Y);
++                bitmap_set(v->cfg.u.bitmap, ABS_MT_SLOT);
++                bitmap_set(v->cfg.u.bitmap, ABS_MT_POSITION_X);
++                bitmap_set(v->cfg.u.bitmap, ABS_MT_POSITION_Y);
++                bitmap_set(v->cfg.u.bitmap, ABS_MT_TRACKING_ID);
++                v->cfg.size = bitmap_min_size(v->cfg.u.bitmap, sizeof(v->cfg.u.bitmap));
++                return;
++            }
++            v->cfg.size = 0;
++            return;
++        }
++
+         if (v->is_keyboard) {
+             if (sub != EV_KEY) {
+                 v->cfg.size = 0;
+@@ -612,11 +651,39 @@ static void virtio_input_update_cfg(virtio_input_dev_t* v)
+     }
+ 
+     if (sel == VIRTIO_INPUT_CFG_ABS_INFO) {
+-        if (v->is_keyboard) {
++        if (v->is_keyboard || !v->is_touch) {
+             v->cfg.size = 0;
+             return;
+         }
+-        v->cfg.size = 0;
++        virtio_input_absinfo_t info = {0};
++        switch (sub) {
++            case ABS_X:
++            case ABS_MT_POSITION_X:
++                write_uint32_le_m(&info.min, 0);
++                write_uint32_le_m(&info.max, v->width);
++                break;
++            case ABS_Y:
++            case ABS_MT_POSITION_Y:
++                write_uint32_le_m(&info.min, 0);
++                write_uint32_le_m(&info.max, v->height);
++                break;
++            case ABS_MT_SLOT:
++                write_uint32_le_m(&info.min, 0);
++                write_uint32_le_m(&info.max, HID_TOUCH_SLOTS - 1);
++                break;
++            case ABS_MT_TRACKING_ID:
++                write_uint32_le_m(&info.min, 0);
++                write_uint32_le_m(&info.max, 0xffff);
++                break;
++            default:
++                v->cfg.size = 0;
++                return;
++        }
++        write_uint32_le_m(&info.fuzz, 0);
++        write_uint32_le_m(&info.flat, 0);
++        write_uint32_le_m(&info.res, 0);
++        v->cfg.u.abs = info;
++        v->cfg.size = (uint8_t)sizeof(info);
+         return;
+     }
+ 
+@@ -1057,7 +1124,7 @@ static rvvm_mmio_type_t virtio_input_dev_type = {
+     .suspend = virtio_input_suspend,
+ };
+ 
+-static rvvm_mmio_dev_t* virtio_input_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq, bool keyboard)
++static rvvm_mmio_dev_t* virtio_input_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq, uint8_t kind)
+ {
+     if (!machine || !intc) {
+         return NULL;
+@@ -1067,7 +1134,8 @@ static rvvm_mmio_dev_t* virtio_input_init(rvvm_machine_t* machine, rvvm_addr_t a
+     v->machine = machine;
+     v->intc = intc;
+     v->irq = irq;
+-    v->is_keyboard = keyboard ? 1 : 0;
++    v->is_keyboard = (kind == 1);
++    v->is_touch = (kind == 2);
+     v->width = 1024;
+     v->height = 768;
+     v->host_features[0] = 0;
+@@ -1136,7 +1204,7 @@ PUBLIC hid_keyboard_t* hid_keyboard_init_auto_virtio(rvvm_machine_t* machine)
+ {
+     rvvm_intc_t* intc = rvvm_get_intc(machine);
+     rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, 0x10002000, 0x1000);
+-    rvvm_mmio_dev_t* mmio = virtio_input_init(machine, addr, intc, rvvm_alloc_irq(intc), true);
++    rvvm_mmio_dev_t* mmio = virtio_input_init(machine, addr, intc, rvvm_alloc_irq(intc), 1);
+     if (!mmio) {
+         return NULL;
+     }
+@@ -1149,7 +1217,7 @@ PUBLIC hid_mouse_t* hid_mouse_init_auto_virtio(rvvm_machine_t* machine)
+ {
+     rvvm_intc_t* intc = rvvm_get_intc(machine);
+     rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, 0x10003000, 0x1000);
+-    rvvm_mmio_dev_t* mmio = virtio_input_init(machine, addr, intc, rvvm_alloc_irq(intc), false);
++    rvvm_mmio_dev_t* mmio = virtio_input_init(machine, addr, intc, rvvm_alloc_irq(intc), 0);
+     if (!mmio) {
+         return NULL;
+     }
+@@ -1257,3 +1325,71 @@ PUBLIC void hid_mouse_place_virtio(hid_mouse_t* mouse, int32_t x, int32_t y)
+     virtio_input_send_event(mouse->dev, EV_ABS, ABS_Y, (int32_t)ny);
+     virtio_input_send_event(mouse->dev, EV_SYN, SYN_REPORT, 0);
+ }
++
++PUBLIC hid_touchscreen_t* hid_touchscreen_init_auto_virtio(rvvm_machine_t* machine)
++{
++    rvvm_intc_t* intc = rvvm_get_intc(machine);
++    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, 0x10005000, 0x1000);
++    rvvm_mmio_dev_t* mmio = virtio_input_init(machine, addr, intc, rvvm_alloc_irq(intc), 2);
++    if (!mmio) {
++        return NULL;
++    }
++    hid_touchscreen_t* ts = safe_new_obj(hid_touchscreen_t);
++    ts->dev = virtio_input_from_mmio(mmio);
++    ts->width = 1024;
++    ts->height = 768;
++    return ts;
++}
++
++PUBLIC void hid_touchscreen_resolution_virtio(hid_touchscreen_t* ts, uint32_t width, uint32_t height)
++{
++    if (!ts || !ts->dev || !width || !height) {
++        return;
++    }
++    ts->width = (uint16_t)width;
++    ts->height = (uint16_t)height;
++    ts->dev->width = ts->width;
++    ts->dev->height = ts->height;
++}
++
++// Multi-touch stream in Linux evdev MT (type B) protocol:
++// contact begins with a fresh tracking id, ends with TRACKING_ID = -1.
++PUBLIC void hid_touch_down_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id, int32_t x, int32_t y)
++{
++    if (!ts || !ts->dev || slot >= HID_TOUCH_SLOTS) {
++        return;
++    }
++    ts->tracking[slot] = tracking_id + 1; // 0 means "no contact" internally
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_SLOT, (int32_t)slot);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_TRACKING_ID, (int32_t)tracking_id);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_POSITION_X, x);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_POSITION_Y, y);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_X, x);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_Y, y);
++    virtio_input_send_event(ts->dev, EV_KEY, BTN_TOUCH, 1);
++    virtio_input_send_event(ts->dev, EV_SYN, SYN_REPORT, 0);
++}
++
++PUBLIC void hid_touch_move_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id, int32_t x, int32_t y)
++{
++    if (!ts || !ts->dev || slot >= HID_TOUCH_SLOTS) {
++        return;
++    }
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_SLOT, (int32_t)slot);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_TRACKING_ID, (int32_t)tracking_id);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_POSITION_X, x);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_POSITION_Y, y);
++    virtio_input_send_event(ts->dev, EV_SYN, SYN_REPORT, 0);
++}
++
++PUBLIC void hid_touch_up_virtio(hid_touchscreen_t* ts, uint32_t slot, uint32_t tracking_id)
++{
++    if (!ts || !ts->dev || slot >= HID_TOUCH_SLOTS) {
++        return;
++    }
++    ts->tracking[slot] = 0;
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_SLOT, (int32_t)slot);
++    virtio_input_send_event(ts->dev, EV_ABS, ABS_MT_TRACKING_ID, -1);
++    virtio_input_send_event(ts->dev, EV_KEY, BTN_TOUCH, 0);
++    virtio_input_send_event(ts->dev, EV_SYN, SYN_REPORT, 0);
++}
