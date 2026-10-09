@@ -53,7 +53,15 @@ jobs:
       - name: Build kernel
         run: |
           chmod +x scripts/*.sh
-          scripts/build-guest-kernel.sh work "${{ inputs.kernel_tag }}"
+          bash -x scripts/build-guest-kernel.sh work "${{ inputs.kernel_tag }}" 2>&1 | tee kernel-build.log
+
+      - name: Upload failure log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-log
+          path: kernel-build.log
+          retention-days: 7
 
       - name: Build rootfs + disk image
         run: |
