@@ -19,19 +19,19 @@ fi
 
 cd "$SRC"
 
-make ARCH=riscv64 CROSS_COMPILE=riscv64-linux-gnu- defconfig
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- defconfig
 
 # Merge the RVVM fragment (all required drivers built-in).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ./scripts/kconfig/merge_config.sh -m .config "$SCRIPT_DIR/guest-kernel.config"
-make ARCH=riscv64 CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- olddefconfig
 
 echo "=== effective virtio/drm/nvme config ==="
 grep -E 'CONFIG_(VIRTIO|DRM_VIRTIO_GPU|BLK_DEV_NVME|FUSE_FS|SERIAL_8250|R8169)' .config | head -30
 
-make ARCH=riscv64 CROSS_COMPILE=riscv64-linux-gnu- -j"$JOBS" Image
+make ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j"$JOBS" Image
 
-cp -a arch/riscv64/boot/Image "$WORKDIR/Image"
+cp -a arch/riscv/boot/Image "$WORKDIR/Image"
 grep -E 'CONFIG_(VIRTIO|DRM|BLK_DEV_NVME|FUSE|VIRTIO_FS|SERIAL_8250|R8169|INPUT_EVDEV)' "$SRC/.config" > "$WORKDIR/kernel-config-report.txt"
 
 echo "kernel image: $WORKDIR/Image ($(stat -c%s "$WORKDIR/Image") bytes)"
