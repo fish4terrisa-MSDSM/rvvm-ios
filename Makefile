@@ -24,6 +24,8 @@ rvvm_FILES = \
 	main.m \
 	RV64AppDelegate.m \
 	RV64RootViewController.m \
+	RV64DisksViewController.m \
+	RV64JIT.m \
 	RV64Runner.mm \
 	$(foreach f,$(RVVM_CORE),$(RVVM_DIR)/src/core/$(f).c) \
 	$(wildcard $(RVVM_DIR)/src/cpu/*.c) \

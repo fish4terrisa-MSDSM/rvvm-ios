@@ -48,4 +48,5 @@ The IPA is written to `packages/`. The bundled Linux images are not included. Us
 - **Boot**: pick an ISO (import from Files, or disable it), a disk image, and port forwards.
 - **Hardware**: cores, RAM (up to 8 GB where the device allows), graphics (simple framebuffer or virtio-gpu 2D), touch input (trackpad or direct touch), background behaviour (off, silent audio, or a background task), firmware (bundled OpenSBI or an imported one), extra disks, and the virtio-fs shared folder.
 - **Documents**: create sparse raw disk images, import disks (imported images are stored sparse), export files, and browse `logs/console.log`. All of this is visible in the Files app under "On My iPhone > rvvm".
-- **JIT**: enable it with StikDebug. The app never passes `nojit`, so RVVM falls back to the interpreter when JIT is unavailable.
+- **Disks**: Settings → Disks lists attached disks in boot order (reorder with Edit), attaches or detaches available images, imports, creates sparse images, exports, and deletes. Changes are refused while the VM runs.
+- **JIT**: enable it with StikDebug. The app never passes `nojit`, so RVVM falls back to the interpreter when JIT is unavailable. The app asks StikDebug to enable JIT once per launch; turn this off with Settings → JIT (StikDebug).

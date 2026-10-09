@@ -1,6 +1,7 @@
 #import "RV64AppDelegate.h"
 #import "RV64RootViewController.h"
 #import "RV64Runner.h"
+#import "RV64JIT.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <dispatch/dispatch.h>
@@ -86,6 +87,8 @@ static NSData *SilentWAVData(void)
 - (void)applicationDidBecomeActive:(UIApplication *)application
 {
 	(void)application;
+	// Asks StikDebug to enable JIT once per launch (rvvm.autoJIT). Must run while active so StikDebug can return to us.
+	[RV64JIT requestJITFromStikDebugIfNeeded];
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		[RV64Runner reinitNetwork];
 	});

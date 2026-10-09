@@ -1,5 +1,6 @@
 #import "RV64RootViewController.h"
 #import "RV64Runner.h"
+#import "RV64DisksViewController.h"
 
 #import <dispatch/dispatch.h>
 #import <QuartzCore/QuartzCore.h>
@@ -21,6 +22,7 @@ static NSString *const kRVVMDefaultsBackgroundMode = @"rvvm.backgroundMode";
 static NSString *const kRVVMDefaultsFirmwareFilename = @"rvvm.firmwareFilename";
 static NSString *const kRVVMDefaultsExtraDisks = @"rvvm.extraDisks";
 static NSString *const kRVVMDefaultsSharesEnabled = @"rvvm.sharesEnabled";
+static NSString *const kRVVMDefaultsAutoJIT = @"rvvm.autoJIT";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -593,6 +595,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @property (nonatomic, copy) NSString *firmwareName;
 @property (nonatomic, copy) NSArray<NSString *> *extraDisks;
 @property (nonatomic) BOOL sharesEnabled;
+@property (nonatomic) BOOL autoJIT;
 @property (nonatomic, copy) NSString *isoFilename;
 @property (nonatomic, copy) NSString *diskFilename;
 @property (nonatomic, copy) NSArray<NSString *> *portForwards;
@@ -859,6 +862,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	self.extraDisks = extra ?: @[];
 	// Sharing defaults to on when the key was never set.
 	self.sharesEnabled = [d objectForKey:kRVVMDefaultsSharesEnabled] ? [d boolForKey:kRVVMDefaultsSharesEnabled] : YES;
+	self.autoJIT = [d objectForKey:kRVVMDefaultsAutoJIT] ? [d boolForKey:kRVVMDefaultsAutoJIT] : YES;
 	NSArray *pf = [d objectForKey:kRVVMDefaultsPortForwards];
 	if ([pf isKindOfClass:[NSArray class]]) {
 		NSMutableArray<NSString *> *arr = [NSMutableArray array];
@@ -890,17 +894,12 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	} else {
 		[d removeObjectForKey:kRVVMDefaultsFirmwareFilename];
 	}
-	[d setObject:(self.extraDisks ?: @[]) forKey:kRVVMDefaultsExtraDisks];
+	[d setBool:self.autoJIT forKey:kRVVMDefaultsAutoJIT];
 	[d setBool:self.sharesEnabled forKey:kRVVMDefaultsSharesEnabled];
 	if (self.isoFilename.length > 0) {
 		[d setObject:self.isoFilename forKey:kRVVMDefaultsIsoFilename];
 	} else {
 		[d removeObjectForKey:kRVVMDefaultsIsoFilename];
-	}
-	if (self.diskFilename.length > 0) {
-		[d setObject:self.diskFilename forKey:kRVVMDefaultsDiskFilename];
-	} else {
-		[d removeObjectForKey:kRVVMDefaultsDiskFilename];
 	}
 	if (self.portForwards.count > 0) {
 		[d setObject:self.portForwards forKey:kRVVMDefaultsPortForwards];
@@ -956,12 +955,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	if (self.disableIso) {
 		return @"Disabled";
 	}
-	return (self.isoFilename.length > 0) ? self.isoFilename : @"Bundled";
+	return (self.isoFilename.length > 0) ? self.isoFilename : @"None";
 }
 
-- (NSString *)diskTitle
+- (NSString *)attachedDisksTitle
 {
-	return (self.diskFilename.length > 0) ? self.diskFilename : @"alpine-riscv64.img";
+	NSArray *list = [NSUserDefaults.standardUserDefaults arrayForKey:@"rvvm.disks"];
+	NSUInteger n = list ? list.count : ((self.diskFilename.length > 0) ? 1 : 0) + self.extraDisks.count;
+	return n == 0 ? @"None" : [NSString stringWithFormat:@"%lu attached", (unsigned long)n];
 }
 
 - (NSString *)snapshotPath
@@ -1055,8 +1056,8 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			cell.accessoryView = nil;
 			cell.selectionStyle = self.disableIso ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
 		} else if (indexPath.row == 2) {
-			cell.textLabel.text = @"Disk";
-			cell.detailTextLabel.text = [self diskTitle];
+			cell.textLabel.text = @"Disks";
+			cell.detailTextLabel.text = [self attachedDisksTitle];
 			cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 			cell.accessoryView = nil;
 			cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -1132,12 +1133,12 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 				cell.detailTextLabel.text = self.firmwareName.length > 0 ? self.firmwareName : @"Bundled OpenSBI";
 				break;
 			case 6:
-				cell.textLabel.text = @"Extra disks";
-				cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu attached", (unsigned long)self.extraDisks.count];
-				break;
-			default:
 				cell.textLabel.text = @"Shared folder (virtio-fs)";
 				cell.detailTextLabel.text = self.sharesEnabled ? @"Documents as \"share\"" : @"Off";
+				break;
+			default:
+				cell.textLabel.text = @"JIT (StikDebug)";
+				cell.detailTextLabel.text = self.autoJIT ? @"Request automatically" : @"Off";
 				break;
 		}
 		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1264,41 +1265,6 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	}];
 }
 
-- (void)presentExtraDisksChoiceFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
-{
-	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-	for (NSString *f in self.docFiles) {
-		NSString *ext = f.pathExtension.lowercaseString;
-		if ([ext isEqualToString:@"img"] || [ext isEqualToString:@"raw"] || [ext isEqualToString:@"qcow2"]) {
-			if (![f isEqualToString:self.diskFilename] && ![f isEqualToString:self.isoFilename]) {
-				[candidates addObject:f];
-			}
-		}
-	}
-	NSMutableArray<NSString *> *opts = [NSMutableArray array];
-	for (NSString *f in candidates) {
-		BOOL attached = [self.extraDisks containsObject:f];
-		[opts addObject:[(attached ? @"Detach " : @"Attach ") stringByAppendingString:f]];
-	}
-	[opts addObject:@"Detach all"];
-	[self presentChoiceWithTitle:@"Extra disks" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
-		if (idx == (NSInteger)candidates.count) {
-			self.extraDisks = @[];
-		} else {
-			NSString *f = candidates[(NSUInteger)idx];
-			NSMutableArray<NSString *> *arr = [self.extraDisks mutableCopy];
-			if ([arr containsObject:f]) {
-				[arr removeObject:f];
-			} else {
-				[arr addObject:f];
-			}
-			self.extraDisks = arr;
-		}
-		[self saveDefaults];
-		[self.tableView reloadData];
-	}];
-}
-
 - (void)presentNewDiskImageFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
 {
 	NSArray<NSNumber *> *sizesGiB = @[@1, @4, @16, @32, @64];
@@ -1314,10 +1280,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			[self presentSimpleAlertWithTitle:@"New disk image" message:err ?: @"Failed"];
 			return;
 		}
-		if (self.diskFilename.length == 0) {
-			self.diskFilename = name;
-		}
-		[self saveDefaults];
+		[RV64DisksViewController attachDiskNamed:name];
 		[self reloadDocFiles];
 		[self.tableView reloadData];
 	}];
@@ -1398,8 +1361,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 			[self saveDefaults];
 			[self.tableView reloadData];
 		} else if ([action isEqualToString:@"disk"]) {
-			self.diskFilename = name;
-			[self saveDefaults];
+			[RV64DisksViewController attachDiskNamed:name];
 			[self.tableView reloadData];
 		} else if ([action isEqualToString:@"expand"]) {
 			[self presentExpandChoiceForName:name sourceView:sourceView sourceRect:sourceRect];
@@ -1624,7 +1586,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	if (access) {
 		[url stopAccessingSecurityScopedResource];
 	}
-	self.diskFilename = dstName;
+	[RV64DisksViewController attachDiskNamed:dstName];
 	[self saveDefaults];
 	[self reloadDocFiles];
 	[self.tableView reloadData];
@@ -1640,7 +1602,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		if (self.disableIso) {
 			return;
 		}
-		NSMutableArray<NSString *> *opts = [NSMutableArray arrayWithObject:@"Bundled"];
+		NSMutableArray<NSString *> *opts = [NSMutableArray arrayWithObject:@"None"];
 		for (NSString *f in self.docFiles) {
 			if ([f.lowercaseString hasSuffix:@".iso"]) {
 				[opts addObject:f];
@@ -1654,18 +1616,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 2) {
-		NSMutableArray<NSString *> *opts = [NSMutableArray arrayWithObject:@"Default (alpine-riscv64.img)"];
-		for (NSString *f in self.docFiles) {
-			NSString *lower = f.lowercaseString;
-			if ([lower hasSuffix:@".img"] || [lower hasSuffix:@".raw"] || [lower hasSuffix:@".qcow2"]) {
-				[opts addObject:f];
-			}
-		}
-		[self presentChoiceWithTitle:@"Disk Image" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
-			self.diskFilename = (idx == 0) ? nil : opts[idx];
-			[self saveDefaults];
-			[self.tableView reloadData];
-		}];
+		[self.navigationController pushViewController:[RV64DisksViewController new] animated:YES];
 		return;
 	}
 	if (indexPath.section == 0 && indexPath.row == 3) {
@@ -1840,12 +1791,16 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		return;
 	}
 	if (indexPath.section == 1 && indexPath.row == 6) {
-		[self presentExtraDisksChoiceFromSourceView:sourceView sourceRect:sourceRect];
+		[self presentChoiceWithTitle:@"Shared folder" options:@[@"Off", @"Share Documents (virtio-fs tag \"share\")"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.sharesEnabled = (idx == 1);
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}];
 		return;
 	}
 	if (indexPath.section == 1 && indexPath.row == 7) {
-		[self presentChoiceWithTitle:@"Shared folder" options:@[@"Off", @"Share Documents (virtio-fs tag \"share\")"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
-			self.sharesEnabled = (idx == 1);
+		[self presentChoiceWithTitle:@"JIT (StikDebug)" options:@[@"Request automatically", @"Off"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.autoJIT = (idx == 0);
 			[self saveDefaults];
 			[self.tableView reloadData];
 		}];

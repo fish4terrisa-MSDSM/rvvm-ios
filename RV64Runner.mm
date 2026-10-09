@@ -58,6 +58,7 @@ static NSString *const kRVVMDefaultsRamMB = @"rvvm.ramMB";
 static NSString *const kRVVMDefaultsDisableIso = @"rvvm.disableIso";
 static NSString *const kRVVMDefaultsIsoFilename = @"rvvm.isoFilename";
 static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
+static NSString *const kRVVMDefaultsDisks = @"rvvm.disks";
 static NSString *const kRVVMDefaultsArchImgFilename = @"rvvm.archImgFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
 static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
@@ -731,6 +732,27 @@ static bool LoadMachineSnapshot(rvvm_machine_t* machine, const std::string& snap
 }
 
 // Attach a raw image as an NVMe disk. Read-only images are opened without write access.
+// Ordered list of Documents-relative disk names to attach (rvvm.disks). Settings written before this key
+// existed used rvvm.diskFilename (primary) plus rvvm.extraDisks; those are migrated here.
+static NSArray<NSString *> *OrderedDiskNames(NSUserDefaults *defaults)
+{
+	NSArray<NSString *> *ordered = [defaults arrayForKey:kRVVMDefaultsDisks];
+	if (ordered) {
+		return ordered;
+	}
+	NSMutableArray<NSString *> *legacy = [NSMutableArray array];
+	NSString *primary = [defaults stringForKey:kRVVMDefaultsDiskFilename];
+	if (primary.length > 0) {
+		[legacy addObject:primary];
+	}
+	for (NSString *name in [defaults arrayForKey:kRVVMDefaultsExtraDisks] ?: @[]) {
+		if (![legacy containsObject:name]) {
+			[legacy addObject:name];
+		}
+	}
+	return legacy;
+}
+
 static bool AttachNVMeDisk(rvvm_machine_t* machine, const std::string& path, bool readOnly)
 {
 	uint32_t opts = readOnly ? RVVM_BLK_READ : RVVM_BLK_RW;
@@ -859,13 +881,10 @@ static bool RunLinuxOnce()
 	@autoreleasepool {
 		NSBundle *bundle = [NSBundle mainBundle];
 		NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-		RVVMBootMode bootMode = (RVVMBootMode)[defaults integerForKey:kRVVMDefaultsBootMode];
 		NSInteger cores = [defaults integerForKey:kRVVMDefaultsCores];
 		NSInteger ramMB = [defaults integerForKey:kRVVMDefaultsRamMB];
 		BOOL disableIso = [defaults boolForKey:kRVVMDefaultsDisableIso];
 		NSString *isoFilename = [defaults stringForKey:kRVVMDefaultsIsoFilename];
-		NSString *diskFilename = [defaults stringForKey:kRVVMDefaultsDiskFilename];
-		NSString *archImgFilename = [defaults stringForKey:kRVVMDefaultsArchImgFilename];
 		NSArray *portForwards = (NSArray *)[defaults objectForKey:kRVVMDefaultsPortForwards];
 		id vfsDbgObj = [defaults objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
 		BOOL virtioFSDebugToUart = vfsDbgObj ? [defaults boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
@@ -896,21 +915,7 @@ static bool RunLinuxOnce()
 			return p;
 		};
 
-		auto DocsFilePath = [&](NSString *filename) -> std::string {
-			if (docsPathUTF8.empty() || filename.length == 0) {
-				return {};
-			}
-			std::string name = UTF8FromNSString(filename);
-			if (name.empty()) {
-				return {};
-			}
-			return docsPathUTF8 + "/" + name;
-		};
-
 		NSURL *fwPayloadURL = [bundle URLForResource:@"fw_payload" withExtension:@"bin" subdirectory:@"rv64linux"];
-		NSURL *alpineIsoURL = [bundle URLForResource:@"alpine-standard-3.23.3-riscv64" withExtension:@"iso" subdirectory:@"rv64linux"];
-		NSURL *alpineDiskSeedURL = [bundle URLForResource:@"alpine-riscv64" withExtension:@"img" subdirectory:@"rv64linux"];
-		NSURL *archImgURL = [bundle URLForResource:@"archriscv-2026-01-07-4g" withExtension:@"img" subdirectory:@"rv64linux"];
 
 		std::string snapPath = SnapshotFilePathUTF8();
 		std::string snapMetaPath = SnapshotMetaPathUTF8();
@@ -918,61 +923,32 @@ static bool RunLinuxOnce()
 		bool haveSnapHeader = (!snapMetaPath.empty() && ReadRvvmSnapshotHeader(snapMetaPath, &snapHdr));
 		bool haveSnap = haveSnapHeader && autoLoadSnapshot && PathExists(snapPath);
 
+		// The ISO is user-imported only (no bundled ISO). Boot from it when set, otherwise boot the first disk.
 		std::string isoPath;
-		if (!disableIso) {
-			isoPath = (isoFilename.length > 0) ? DocsFilePathIfExists(isoFilename) : FileSystemPath(alpineIsoURL);
+		if (!disableIso && isoFilename.length > 0) {
+			isoPath = DocsFilePathIfExists(isoFilename);
 		}
-		bool isoPossible = (!disableIso) && (fwPayloadURL != nil) && !isoPath.empty();
-		std::string diskImgPath = DocsFilePathIfExists(diskFilename);
-		bool diskImgPossible = (diskFilename.length > 0) && !diskImgPath.empty();
-		bool archPossible = (fwPayloadURL != nil) && (diskImgPossible || (archImgFilename.length > 0 && !DocsFilePathIfExists(archImgFilename).empty()) || (archImgURL != nil));
-
-		BOOL useIso = NO;
-		BOOL useArchImage = NO;
-		switch (bootMode) {
-			case RVVMBootModeAlpine:
-				if (!isoPossible) {
-					PostUARTText("rvvm: alpine ISO disabled or missing\n");
-					return false;
-				}
-				useIso = YES;
-				break;
-			case RVVMBootModeArch:
-				if (!archPossible) {
-					PostUARTText("rvvm: arch image missing\n");
-					return false;
-				}
-				useArchImage = YES;
-				break;
-			case RVVMBootModeCustom:
-				if (isoPossible) {
-					useIso = YES;
-				} else if (archPossible) {
-					useArchImage = YES;
-				} else {
-					PostUARTText("rvvm: no bootable image (ISO disabled/missing and no disk image)\n");
-					return false;
-				}
-				break;
-			case RVVMBootModeAuto:
-			default:
-				if (isoPossible) {
-					useIso = YES;
-				} else if (archPossible) {
-					useArchImage = YES;
-				} else {
-					PostUARTText("rvvm: no bootable image (ISO disabled/missing and no disk image)\n");
-					return false;
-				}
-				break;
+		// Attached disks in the user's order. Names whose files are missing are skipped.
+		std::vector<std::string> diskPaths;
+		for (NSString *name in OrderedDiskNames(defaults)) {
+			std::string p = DocsFilePathIfExists(name);
+			if (!p.empty()) {
+				diskPaths.push_back(p);
+			}
 		}
-
-		NSURL *biosURL = fwPayloadURL;
-		if (!biosURL || (!useIso && !useArchImage)) {
+		if (!fwPayloadURL) {
 			PostUARTText("rvvm: missing boot resources\n");
 			return false;
 		}
+		bool useIso = !isoPath.empty();
+		bool useDiskBoot = !useIso && !diskPaths.empty();
+		if (!useIso && !useDiskBoot) {
+			PostUARTText("rvvm: nothing to boot: import an ISO or attach a disk image\n");
+			return false;
+		}
+		std::string firstDiskPath = diskPaths.empty() ? std::string() : diskPaths.front();
 
+		NSURL *biosURL = fwPayloadURL;
 		std::string biosPath = FileSystemPath(biosURL);
 		NSString *fwName = [defaults stringForKey:kRVVMDefaultsFirmwareFilename];
 		if (fwName.length > 0) {
@@ -983,110 +959,6 @@ static bool RunLinuxOnce()
 				PostUARTText("rvvm: selected firmware missing, using bundled OpenSBI\n");
 			}
 		}
-		std::string imagePath;
-		std::string installDiskPath;
-		if (useArchImage) {
-			if (diskImgPossible) {
-				imagePath = diskImgPath;
-			} else if (archImgFilename.length > 0) {
-				imagePath = DocsFilePathIfExists(archImgFilename);
-				if (imagePath.empty()) {
-					PostUARTText("rvvm: arch image missing\n");
-					return false;
-				}
-			} else {
-				if (haveSnap) {
-					PostUARTText("rvvm: snapshot load requires existing disk image\n");
-					return false;
-				}
-				if (docsDirPath.length == 0 || docsPathUTF8.empty()) {
-					PostUARTText("rvvm: missing documents dir\n");
-					return false;
-				}
-				std::string dstPathUTF8 = docsPathUTF8 + "/archriscv-2026-01-07-4g.img";
-				CFStringRef cfDstPath = CFStringCreateWithCString(kCFAllocatorDefault, dstPathUTF8.c_str(), kCFStringEncodingUTF8);
-				NSString *dstPath = cfDstPath ? (__bridge_transfer NSString *)cfDstPath : nil;
-				if (!dstPath) {
-					PostUARTText("rvvm: disk image dst path failed\n");
-					return false;
-				}
-
-				if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
-					std::string srcPath = FileSystemPath(archImgURL);
-					if (srcPath.empty()) {
-						PostUARTText("rvvm: disk image missing path\n");
-						return false;
-					}
-					CFStringRef cfSrcPath = CFStringCreateWithCString(kCFAllocatorDefault, srcPath.c_str(), kCFStringEncodingUTF8);
-					NSString *srcPathStr = cfSrcPath ? (__bridge_transfer NSString *)cfSrcPath : nil;
-					if (!srcPathStr) {
-						PostUARTText("rvvm: disk image src path failed\n");
-						return false;
-					}
-					NSError *err = nil;
-					if (![[NSFileManager defaultManager] copyItemAtPath:srcPathStr toPath:dstPath error:&err]) {
-						PostUARTText("rvvm: disk image copy failed\n");
-						return false;
-					}
-				}
-				imagePath = dstPathUTF8;
-			}
-		}
-		if (useIso) {
-			if (isoPath.empty()) {
-				PostUARTText("rvvm: iso path failed\n");
-				return false;
-			}
-			if (docsDirPath.length == 0 || docsPathUTF8.empty()) {
-				PostUARTText("rvvm: missing documents dir\n");
-				return false;
-			}
-			installDiskPath = (diskFilename.length > 0) ? DocsFilePath(diskFilename) : (docsPathUTF8 + "/alpine-riscv64.img");
-
-			CFStringRef cfInstallDiskPath = CFStringCreateWithCString(kCFAllocatorDefault, installDiskPath.c_str(), kCFStringEncodingUTF8);
-			NSString *installDiskPathStr = cfInstallDiskPath ? (__bridge_transfer NSString *)cfInstallDiskPath : nil;
-			if (!installDiskPathStr) {
-				PostUARTText("rvvm: install disk path failed\n");
-				return false;
-			}
-			if (!haveSnap && diskFilename.length == 0 && ![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
-				std::string seedPath = FileSystemPath(alpineDiskSeedURL);
-				if (!seedPath.empty()) {
-					CFStringRef cfSeedPath = CFStringCreateWithCString(kCFAllocatorDefault, seedPath.c_str(), kCFStringEncodingUTF8);
-					NSString *seedPathStr = cfSeedPath ? (__bridge_transfer NSString *)cfSeedPath : nil;
-					if (seedPathStr) {
-						NSError *err = nil;
-						if (![[NSFileManager defaultManager] copyItemAtPath:seedPathStr toPath:installDiskPathStr error:&err]) {
-							PostUARTText("rvvm: install disk seed copy failed\n");
-						}
-					}
-				}
-			}
-
-			if (!haveSnap) {
-				size_t diskSize = 0;
-				static const size_t sizes[] = {
-					(size_t)(1ULL << 30),
-				};
-
-				bool ok = false;
-				for (size_t s : sizes) {
-					if (EnsureSparseRawImage(installDiskPath, s, &diskSize)) {
-						ok = true;
-						break;
-					}
-				}
-				if (!ok) {
-					PostUARTText("rvvm: install disk create failed\n");
-					return false;
-				}
-			} else {
-				if (![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
-					PostUARTText("rvvm: snapshot load requires existing install disk\n");
-					return false;
-				}
-			}
-		}
 
 		size_t preferredMem = 0;
 		if (haveSnap) {
@@ -1094,7 +966,7 @@ static bool RunLinuxOnce()
 		} else if (ramMB > 0) {
 			preferredMem = (size_t)ramMB << 20;
 		} else {
-			preferredMem = useIso ? (size_t)(1ULL << 30) : (useArchImage ? (size_t)(2ULL << 30) : (size_t)(256ULL << 20));
+			preferredMem = useIso ? (size_t)(1ULL << 30) : (size_t)(2ULL << 30);
 		}
 		static const size_t fallbacks[] = {
 			(size_t)(8ULL << 30),
@@ -1230,18 +1102,6 @@ static bool RunLinuxOnce()
 				(void)tap_portfwd(tap, fwd.c_str());
 			}
 		}
-		if (useArchImage) {
-			if (!AttachNVMeDisk(machine, imagePath, false)) {
-				PostUARTText("rvvm: nvme failed\n");
-				if (tap) {
-					tap_close(tap);
-				}
-				chardev_free(chardev);
-				rvvm_free_machine(machine);
-				(void)rvvm_fbdev_dec_ref(fbdev);
-				return false;
-			}
-		}
 		if (useIso) {
 			if (!AttachNVMeDisk(machine, isoPath, true)) {
 				PostUARTText("rvvm: nvme iso failed\n");
@@ -1253,25 +1113,11 @@ static bool RunLinuxOnce()
 				(void)rvvm_fbdev_dec_ref(fbdev);
 				return false;
 			}
-			if (!AttachNVMeDisk(machine, installDiskPath, false)) {
-				PostUARTText("rvvm: nvme disk failed\n");
-				if (tap) {
-					tap_close(tap);
-				}
-				chardev_free(chardev);
-				rvvm_free_machine(machine);
-				(void)rvvm_fbdev_dec_ref(fbdev);
-				return false;
-			}
 		}
-		NSArray<NSString *> *extraDisks = [defaults arrayForKey:kRVVMDefaultsExtraDisks];
-		for (NSString *name in extraDisks) {
-			std::string extraPath = DocsFilePathIfExists(name);
-			if (extraPath.empty() || extraPath == imagePath || extraPath == installDiskPath || extraPath == isoPath) {
-				continue;
-			}
-			if (!AttachNVMeDisk(machine, extraPath, false)) {
-				PostUARTText(("rvvm: extra disk failed: " + extraPath + "\n").c_str());
+		// Attached disks, in the order the user set in the Disks screen.
+		for (const std::string& path : diskPaths) {
+			if (!AttachNVMeDisk(machine, path, false)) {
+				PostUARTText(("rvvm: disk attach failed: " + path + "\n").c_str());
 			}
 		}
 
@@ -1344,7 +1190,7 @@ static bool RunLinuxOnce()
 			s_fb_stride.store(0, std::memory_order_relaxed);
 			s_fb_format.store(0, std::memory_order_relaxed);
 			s_fb_offset.store(0, std::memory_order_relaxed);
-			s_active_writable_disk_path = useIso ? installDiskPath : (useArchImage ? imagePath : std::string());
+			s_active_writable_disk_path = firstDiskPath;
 		}
 		rvvm_start_machine(machine);
 		for (;;) {
