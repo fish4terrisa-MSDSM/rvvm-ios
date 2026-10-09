@@ -34,6 +34,8 @@ static NSString *RVVMHumanSize(unsigned long long bytes)
 	return [NSString stringWithFormat:@"%llu B", bytes];
 }
 
+static uint64_t RV64ParseSize(NSString *s);
+
 #pragma mark - Disks & ISOs
 
 @interface RV64DisksViewController () <UIDocumentPickerDelegate, UITextFieldDelegate>
