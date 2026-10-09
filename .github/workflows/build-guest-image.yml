@@ -20,6 +20,12 @@ on:
         description: "Guest disk image size"
         required: false
         default: "8G"
+  pull_request:
+    paths:
+      - "scripts/build-guest-image.sh"
+      - "scripts/build-guest-kernel.sh"
+      - "scripts/guest-kernel.config"
+      - ".github/workflows/build-guest-image.yml"
 
 jobs:
   build:
