@@ -55,13 +55,12 @@ jobs:
           chmod +x scripts/*.sh
           bash -x scripts/build-guest-kernel.sh work "${{ inputs.kernel_tag }}" 2>&1 | tee kernel-build.log
 
-      - name: Upload failure log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-build-log
-          path: kernel-build.log
-          retention-days: 7
+      - name: Annotate failure
+        if: failure()
+        run: |
+          { echo "::error::kernel build failed; log tail follows"
+            tail -c 5000 kernel-build.log | tr '\n' '~' | fold -w 4000 | head -3 | while IFS= read -r l; do echo "::error::$l"; done
+          } || true
 
       - name: Build rootfs + disk image
         run: |
