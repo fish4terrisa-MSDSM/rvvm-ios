@@ -1,0 +1,910 @@
+From 4940b4405acae58a26ea160a60302bf1b338d4e4 Mon Sep 17 00:00:00 2001
+From: rvvm-ios <rvvm-ios@local>
+Date: Fri, 9 Oct 2026 07:16:31 +0000
+Subject: [PATCH 9/9] virtio-gpu: virglrenderer backend (virgl + venus
+ capsets), blob resources, backend selection
+
+---
+ src/devices/virtio-gpu.c | 761 ++++++++++++++++++++++++++++++++++++++-
+ src/devices/virtio-gpu.h |  15 +
+ src/main.c               |  30 +-
+ 3 files changed, 799 insertions(+), 7 deletions(-)
+
+diff --git a/src/devices/virtio-gpu.c b/src/devices/virtio-gpu.c
+index fb25559..5e4a896 100644
+--- a/src/devices/virtio-gpu.c
++++ b/src/devices/virtio-gpu.c
+@@ -115,6 +115,7 @@ enum {
+     VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB = 0x0119,
+     VIRTIO_GPU_CMD_SET_SCANOUT_BLOB   = 0x011a,
+     VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID = 0x011b,
++    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB = 0x011c,
+     VIRTIO_GPU_CMD_UPDATE_CURSOR      = 0x0300,
+     VIRTIO_GPU_CMD_MOVE_CURSOR        = 0x0301,
+ };
+@@ -133,6 +134,20 @@ enum {
+     VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID = 0x8203,
+     VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID  = 0x8204,
+     VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER   = 0x8205,
++
++    VIRTIO_GPU_BLOB_MEM_GUEST        = 0x0001,
++    VIRTIO_GPU_BLOB_MEM_HOST3D       = 0x0002,
++    VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST = 0x0003,
++    VIRTIO_GPU_BLOB_MEM_GUEST_VRAM   = 0x0004,
++
++    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE     = 0x0001,
++    VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE    = 0x0002,
++    VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE = 0x0004,
++
++    VIRTIO_GPU_MAP_CACHE_NONE    = 0x0000,
++    VIRTIO_GPU_MAP_CACHE_CACHED  = 0x0001,
++    VIRTIO_GPU_MAP_CACHE_UNCACHED = 0x0002,
++    VIRTIO_GPU_MAP_CACHE_WC      = 0x0003,
+ };
+ 
+ #define VIRTIO_GPU_FLAG_FENCE  0x01
+@@ -211,6 +226,11 @@ typedef struct {
+     bool     used;
+     bool     is_3d;
+     bool     is_cursor;
++    // Blob resources (venus / gfxstream)
++    bool     blob;
++    uint64_t blob_size;
++    void*    blob_map;
++    uint64_t blob_map_size;
+     uint32_t width;
+     uint32_t height;
+     uint32_t bpp;
+@@ -320,9 +340,14 @@ typedef struct {
+ 
+ #ifdef RUTABAGA_BRIDGE
+     struct rutabaga_rv_bridge* rtb;
++    uint32_t g3d_kind; // 0 = none, 1 = rutabaga, 2 = virgl/venus
+ #endif
+ } virtio_gpu_dev_t;
+ 
++#define G3D_NONE     0
++#define G3D_RUTABAGA 1
++#define G3D_VIRGL    2
++
+ /*
+  * Virtqueue helpers
+  */
+@@ -561,7 +586,9 @@ static void vg_resource_unref(virtio_gpu_dev_t* vg, virtio_gpu_resource_t* res)
+     }
+ #ifdef RUTABAGA_BRIDGE
+     if (vg->rtb && res->is_3d) {
+-        vg->rtb->resource_detach_backing(vg->rtb->rata, res->id);
++        if (!res->blob) {
++            vg->rtb->resource_detach_backing(vg->rtb->rata, res->id);
++        }
+         vg->rtb->resource_unref(vg->rtb->rata, res->id);
+     }
+ #else
+@@ -961,8 +988,593 @@ static bool vg_rutabaga_load(virtio_gpu_dev_t* vg, const char* libpath)
+ 
+     rtb->dl = dl;
+     vg->rtb = rtb;
++    vg->g3d_kind = G3D_RUTABAGA;
+     // Advertise virgl acceleration to the guest
+     vg->host_features[0] |= 1U << VIRTIO_GPU_F_VIRGL;
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_RESOURCE_BLOB;
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_CONTEXT_INIT;
++    return true;
++}
++#endif
++
++
++#ifdef VIRGL_BRIDGE
++/*
++ * Virglrenderer backend bridge (virgl + venus).
++ *
++ * Implements the same internal 3D ops shape as the rutabaga bridge on top of
++ * libvirglrenderer, which hosts BOTH the classic virgl (Gallium/GLES) path
++ * and the venus (Vulkan command serialization) path. On iOS the venus path
++ * runs on top of MoltenVK - no Metal API is used by RVVM itself.
++ */
++struct virgl_rv_state {
++    void* dl;
++    uint32_t want_mask; // VG3D_VIRGL | VG3D_VENUS
++    struct {
++        int (*init)(void* cookie, int flags, void* cb);
++        void (*cleanup)(void* cookie);
++        void (*poll)(void);
++        int (*context_create_with_flags)(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char* name);
++        void (*context_destroy)(uint32_t handle);
++        int (*ctx_attach_resource)(int ctx_id, int res_handle);
++        void (*ctx_detach_resource)(int ctx_id, int res_handle);
++        int (*resource_create)(void* args, void* iov, uint32_t num_iovs);
++        void (*resource_unref)(uint32_t res_handle);
++        int (*resource_attach_iov)(int res_handle, void* iov, int num_iovs);
++        void (*resource_detach_iov)(int res_handle, void** iov, int* num_iovs);
++        int (*transfer_read_iov)(uint32_t handle, uint32_t ctx_id, uint32_t level, uint32_t stride,
++                                 uint32_t layer_stride, void* box, uint64_t offset, void* iov, int iovec_cnt);
++        int (*transfer_write_iov)(uint32_t handle, uint32_t ctx_id, int level, uint32_t stride,
++                                  uint32_t layer_stride, void* box, uint64_t offset, void* iovec,
++                                  unsigned int iovec_cnt);
++        int (*submit_cmd)(void* buffer, int ctx_id, int ndw);
++        int (*create_fence)(int client_fence_id, uint32_t ctx_id);
++        void (*get_cap_set)(uint32_t set, uint32_t* max_ver, uint32_t* max_size);
++        void (*fill_caps)(uint32_t set, uint32_t version, void* caps);
++        int (*resource_create_blob)(const void* args);
++        int (*resource_map)(uint32_t res_handle, void** map, uint64_t* out_size);
++        int (*resource_unmap)(uint32_t res_handle);
++        int (*resource_get_map_info)(uint32_t res_handle, uint32_t* map_info);
++        int (*context_create_fence)(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id);
++    } fn;
++};
++
++#define VG3D_VIRGL 1
++#define VG3D_VENUS 2
++
++// capset enumeration for the virgl/venus backend
++static const uint32_t vg_virgl_capsets[] = { VG_CAPSET_VIRGL, VG_CAPSET_VIRGL2, VG_CAPSET_VENUS };
++
++static void vg_virgl_write_fence(void* cookie, uint32_t fence)
++{
++    UNUSED(cookie);
++    UNUSED(fence);
++    // Fences are completed synchronously in the request path
++}
++
++static void vg_virgl_write_context_fence(void* cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id)
++{
++    UNUSED(cookie);
++    UNUSED(ctx_id);
++    UNUSED(ring_idx);
++    UNUSED(fence_id);
++}
++
++// virgl_renderer_callbacks: only the leading fence callbacks are needed when
++// virglrenderer owns its winsys (or for venus-only operation).
++typedef struct {
++    void (*write_fence)(void* cookie, uint32_t fence);
++    void* create_gl_context;
++    void* destroy_gl_context;
++    void* make_current;
++    void* get_drm_fd;
++    void (*write_context_fence)(void* cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
++} vg_virgl_callbacks_t;
++
++static int32_t vg_vg_get_num_capsets(struct rutabaga* ptr, uint32_t* num)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !num) {
++        return -1;
++    }
++    uint32_t count = 0;
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg_virgl_capsets); ++i) {
++        uint32_t ver = 0, size = 0;
++        uint32_t id = vg_virgl_capsets[i];
++        if ((id == VG_CAPSET_VENUS && !(st->want_mask & VG3D_VENUS)) ||
++            (id != VG_CAPSET_VENUS && !(st->want_mask & VG3D_VIRGL))) {
++            continue;
++        }
++        st->fn.get_cap_set(id, &ver, &size);
++        if (size > 0) {
++            ++count;
++        }
++    }
++    *num = count;
++    return 0;
++}
++
++static int32_t vg_vg_get_capset_info(struct rutabaga* ptr, uint32_t idx, uint32_t* id, uint32_t* ver, uint32_t* size)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !id || !ver || !size) {
++        return -1;
++    }
++    uint32_t count = 0;
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg_virgl_capsets); ++i) {
++        uint32_t cid = vg_virgl_capsets[i];
++        if ((cid == VG_CAPSET_VENUS && !(st->want_mask & VG3D_VENUS)) ||
++            (cid != VG_CAPSET_VENUS && !(st->want_mask & VG3D_VIRGL))) {
++            continue;
++        }
++        uint32_t cver = 0, csize = 0;
++        st->fn.get_cap_set(cid, &cver, &csize);
++        if (csize == 0) {
++            continue;
++        }
++        if (count == idx) {
++            *id = cid;
++            *ver = cver;
++            *size = csize;
++            return 0;
++        }
++        ++count;
++    }
++    return -1;
++}
++
++static int32_t vg_vg_get_capset(struct rutabaga* ptr, uint32_t id, uint32_t version, uint8_t* capset, uint32_t size)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !capset || !size) {
++        return -1;
++    }
++    uint32_t ver = 0, csize = 0;
++    st->fn.get_cap_set(id, &ver, &csize);
++    if (csize == 0 || csize > size) {
++        return -1;
++    }
++    memset(capset, 0, size);
++    st->fn.fill_caps(id, version, capset);
++    return 0;
++}
++
++static int32_t vg_vg_context_create(struct rutabaga* ptr, uint32_t ctx_id, uint32_t context_init, const char* name,
++                                    uint32_t name_len)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    // context_init carries the capset id in the low 8 bits
++    uint32_t capset = context_init & 0xff;
++    if (capset == 0) {
++        capset = VG_CAPSET_VIRGL;
++    }
++    char namebuf[65];
++    if (!name || name_len == 0) {
++        namebuf[0] = 0;
++        name = namebuf;
++    } else {
++        if (name_len > 64) {
++            name_len = 64;
++        }
++        memcpy(namebuf, name, name_len);
++        namebuf[name_len] = 0;
++        name = namebuf;
++    }
++    return st->fn.context_create_with_flags(ctx_id, capset, name_len, name) ? -1 : 0;
++}
++
++static int32_t vg_vg_context_destroy(struct rutabaga* ptr, uint32_t ctx_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    st->fn.context_destroy(ctx_id);
++    return 0;
++}
++
++static int32_t vg_vg_context_attach_resource(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    return st->fn.ctx_attach_resource((int)ctx_id, (int)res_id) ? -1 : 0;
++}
++
++static int32_t vg_vg_context_detach_resource(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    st->fn.ctx_detach_resource((int)ctx_id, (int)res_id);
++    return 0;
++}
++
++static int32_t vg_vg_resource_create_3d(struct rutabaga* ptr, uint32_t res_id, const void* create_3d)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !create_3d) {
++        return -1;
++    }
++    // create_3d: {target,format,bind,w,h,depth,array_size,last_level,nr_samples,flags}
++    const uint32_t* c3d = (const uint32_t*)create_3d;
++    uint32_t args[11] = {
++        res_id, c3d[0], c3d[1], c3d[2], c3d[3], c3d[4], c3d[5], c3d[6], c3d[7], c3d[8], c3d[9],
++    };
++    return st->fn.resource_create(args, NULL, 0) ? -1 : 0;
++}
++
++static int32_t vg_vg_resource_attach_backing(struct rutabaga* ptr, uint32_t res_id, const void* iovecs)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !iovecs) {
++        return -1;
++    }
++    // iovecs: { void* vecs; size_t count; } with vecs[] = { void* base; size_t len; }
++    struct {
++        void* vecs;
++        size_t count;
++    }* io = (void*)(uintptr_t)iovecs;
++    return st->fn.resource_attach_iov((int)res_id, io->vecs, (int)io->count) ? -1 : 0;
++}
++
++static int32_t vg_vg_resource_detach_backing(struct rutabaga* ptr, uint32_t res_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    st->fn.resource_detach_iov((int)res_id, NULL, NULL);
++    return 0;
++}
++
++static int32_t vg_vg_resource_transfer_read(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id,
++                                            const void* transfer, const void* iovec)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !transfer || !iovec) {
++        return -1;
++    }
++    // transfer: {x,y,z,w,h,d,level,stride,layer_stride,pad,offset u64}
++    const uint8_t* t = (const uint8_t*)transfer;
++    uint32_t box[6];
++    memcpy(box, t, 24);
++    uint32_t level, stride, layer_stride;
++    memcpy(&level, t + 24, 4);
++    memcpy(&stride, t + 28, 4);
++    memcpy(&layer_stride, t + 32, 4);
++    uint64_t offset;
++    memcpy(&offset, t + 40, 8);
++    return st->fn.transfer_read_iov(res_id, ctx_id, level, stride, layer_stride, box, offset,
++                                    (void*)(uintptr_t)iovec, 1)
++               ? -1
++               : 0;
++}
++
++static int32_t vg_vg_resource_transfer_write(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id,
++                                             const void* transfer)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !transfer) {
++        return -1;
++    }
++    const uint8_t* t = (const uint8_t*)transfer;
++    uint32_t box[6];
++    memcpy(box, t, 24);
++    uint32_t level, stride, layer_stride;
++    memcpy(&level, t + 24, 4);
++    memcpy(&stride, t + 28, 4);
++    memcpy(&layer_stride, t + 32, 4);
++    uint64_t offset;
++    memcpy(&offset, t + 40, 8);
++    // Data is taken from the attached backing iovs
++    return st->fn.transfer_write_iov(res_id, ctx_id, (int)level, stride, layer_stride, box, offset, NULL, 0)
++               ? -1
++               : 0;
++}
++
++static int32_t vg_vg_resource_create_blob(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id,
++                                          const void* create_blob, const void* iovecs, const void* handle)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !create_blob) {
++        return -1;
++    }
++    UNUSED(handle);
++    // create_blob: {blob_mem u32, blob_flags u32, blob_id u64, size u64}
++    struct {
++        uint32_t blob_mem;
++        uint32_t blob_flags;
++        uint64_t blob_id;
++        uint64_t size;
++    } cb;
++    memcpy(&cb, create_blob, sizeof(cb));
++    void* iov_ptr = NULL;
++    uint32_t iov_cnt = 0;
++    if (iovecs) {
++        struct {
++            void* vecs;
++            size_t count;
++        }* io = (void*)(uintptr_t)iovecs;
++        iov_ptr = io->vecs;
++        iov_cnt = (uint32_t)io->count;
++    }
++    // struct virgl_renderer_resource_create_blob_args
++    struct {
++        uint32_t res_handle;
++        uint32_t ctx_id;
++        uint32_t blob_mem;
++        uint32_t blob_flags;
++        uint64_t blob_id;
++        uint64_t size;
++        const void* iovecs;
++        uint32_t num_iovs;
++    } args = {
++        res_id, ctx_id, cb.blob_mem, cb.blob_flags, cb.blob_id, cb.size, iov_ptr, iov_cnt,
++    };
++    return st->fn.resource_create_blob(&args) ? -1 : 0;
++}
++
++static int32_t vg_vg_resource_unref(struct rutabaga* ptr, uint32_t res_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    st->fn.resource_unref(res_id);
++    return 0;
++}
++
++static int32_t vg_vg_resource_map(struct rutabaga* ptr, uint32_t res_id, void* mapping)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !mapping) {
++        return -1;
++    }
++    // mapping: { uint64_t ptr; uint64_t size; } (rutabaga_mapping)
++    void* map = NULL;
++    uint64_t size = 0;
++    if (st->fn.resource_map(res_id, &map, &size)) {
++        return -1;
++    }
++    uint64_t out[2] = { (uint64_t)(uintptr_t)map, size };
++    memcpy(mapping, out, sizeof(out));
++    return 0;
++}
++
++static int32_t vg_vg_resource_unmap(struct rutabaga* ptr, uint32_t res_id)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st) {
++        return -1;
++    }
++    return st->fn.resource_unmap(res_id) ? -1 : 0;
++}
++
++static int32_t vg_vg_resource_map_info(struct rutabaga* ptr, uint32_t res_id, uint32_t* map_info)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !map_info) {
++        return -1;
++    }
++    return st->fn.resource_get_map_info(res_id, map_info) ? -1 : 0;
++}
++
++static int32_t vg_vg_submit_command(struct rutabaga* ptr, void* cmd)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !cmd) {
++        return -1;
++    }
++    // cmd: {ctx_id, cmd_size, cmd*}
++    struct {
++        uint32_t ctx_id;
++        uint32_t cmd_size;
++        uint8_t* cmdbuf;
++    }* c = (void*)(uintptr_t)cmd;
++    if (!c->cmdbuf || c->cmd_size == 0 || (c->cmd_size & 3)) {
++        return -1;
++    }
++    return st->fn.submit_cmd(c->cmdbuf, (int)c->ctx_id, (int)(c->cmd_size / 4)) ? -1 : 0;
++}
++
++static int32_t vg_vg_create_fence(struct rutabaga* ptr, const void* fence)
++{
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)ptr;
++    if (!st || !fence) {
++        return -1;
++    }
++    // fence: {flags u32, pad u32, fence_id u64, ctx_id u32, ring_idx u32}
++    const uint8_t* f = (const uint8_t*)fence;
++    uint64_t fence_id;
++    uint32_t ctx_id, ring_idx;
++    memcpy(&fence_id, f + 8, 8);
++    memcpy(&ctx_id, f + 16, 4);
++    memcpy(&ring_idx, f + 20, 4);
++    if (st->fn.context_create_fence) {
++        return st->fn.context_create_fence(ctx_id, 0, ring_idx, fence_id) ? -1 : 0;
++    }
++    return st->fn.create_fence((int)(fence_id & 0xFFFFFFFFU), ctx_id) ? -1 : 0;
++}
++
++static int32_t vg_vg_finish(struct rutabaga** ptr)
++{
++    if (!ptr || !*ptr) {
++        return -1;
++    }
++    struct virgl_rv_state* st = (struct virgl_rv_state*)(uintptr_t)*ptr;
++    st->fn.cleanup(NULL);
++    if (st->dl) {
++        dlclose(st->dl);
++    }
++    free(st);
++    *ptr = NULL;
++    return 0;
++}
++
++static int32_t vg_vg_init(const void* builder, struct rutabaga** ptr)
++{
++    const struct rutabaga_builder_rv* b = (const struct rutabaga_builder_rv*)builder;
++    if (!b || !ptr) {
++        return -1;
++    }
++    struct virgl_rv_state* st = (struct virgl_rv_state*)b->user_data;
++    // user_data carries the prepared virgl state (set up in vg_virgl_load)
++    if (!st) {
++        return -1;
++    }
++    // Flags: surfaceless + GLES winsys for virgl; venus renderer enabled as
++    // requested. VIRGL_RENDERER_NO_VIRGL when only venus is wanted.
++    int flags = 0;
++    if (st->want_mask & VG3D_VIRGL) {
++        flags |= (1 << 0) /* USE_EGL */ | (1 << 3) /* USE_SURFACELESS */ | (1 << 4) /* USE_GLES */;
++    }
++    if (st->want_mask & VG3D_VENUS) {
++        flags |= (1 << 5) /* USE_EXTERNAL_BLOB */ | (1 << 6) /* VIRGL_RENDERER_VENUS */;
++    }
++    if (!(st->want_mask & VG3D_VIRGL) && (st->want_mask & VG3D_VENUS)) {
++        flags |= (1 << 7) /* VIRGL_RENDERER_NO_VIRGL */;
++    }
++    vg_virgl_callbacks_t cb;
++    memset(&cb, 0, sizeof(cb));
++    cb.write_fence = vg_virgl_write_fence;
++    cb.write_context_fence = vg_virgl_write_context_fence;
++    if (st->fn.init(NULL, flags, &cb)) {
++        return -1;
++    }
++    *ptr = (struct rutabaga*)(uintptr_t)st;
++    return 0;
++}
++
++static bool vg_virgl_load(virtio_gpu_dev_t* vg, const char* libpath, uint32_t want_mask)
++{
++    static const char* paths[] = {
++        "libvirglrenderer.so.1",
++        "libvirglrenderer.so.0",
++        "libvirglrenderer.so",
++        "/usr/local/lib/libvirglrenderer.so",
++        "/usr/lib/libvirglrenderer.so",
++    };
++    void* dl = NULL;
++    if (libpath) {
++        dl = dlopen(libpath, RTLD_NOW | RTLD_LOCAL);
++    }
++    for (size_t i = 0; !dl && i < STATIC_ARRAY_SIZE(paths); ++i) {
++        dl = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
++    }
++    if (!dl) {
++        rvvm_warn("virtio-gpu: virglrenderer library not found (%s)", libpath ? libpath : "auto");
++        return false;
++    }
++
++    struct virgl_rv_state* st = calloc(1, sizeof(*st));
++    if (!st) {
++        dlclose(dl);
++        return false;
++    }
++    st->dl = dl;
++    st->want_mask = want_mask;
++
++#define VG_SYM(name)                                                   \
++    do {                                                               \
++        st->fn.name = dlsym(dl, #name);                                \
++        if (!st->fn.name) {                                            \
++            rvvm_warn("virtio-gpu: virglrenderer missing symbol %s", #name); \
++            free(st);                                                  \
++            dlclose(dl);                                               \
++            return false;                                              \
++        }                                                              \
++    } while (0)
++#define VG_SYM_OPT(name)                                               \
++    do {                                                               \
++        st->fn.name = dlsym(dl, #name);                                \
++    } while (0)
++
++    VG_SYM(init);
++    VG_SYM(cleanup);
++    VG_SYM_OPT(poll);
++    VG_SYM(context_create_with_flags);
++    VG_SYM(context_destroy);
++    VG_SYM(ctx_attach_resource);
++    VG_SYM(ctx_detach_resource);
++    VG_SYM(resource_create);
++    VG_SYM(resource_unref);
++    VG_SYM(resource_attach_iov);
++    VG_SYM(resource_detach_iov);
++    VG_SYM(transfer_read_iov);
++    VG_SYM(transfer_write_iov);
++    VG_SYM(submit_cmd);
++    VG_SYM(create_fence);
++    VG_SYM(get_cap_set);
++    VG_SYM(fill_caps);
++    VG_SYM(resource_create_blob);
++    VG_SYM(resource_map);
++    VG_SYM(resource_unmap);
++    VG_SYM(resource_get_map_info);
++    VG_SYM_OPT(context_create_fence);
++#undef VG_SYM
++#undef VG_SYM_OPT
++
++    // Fill the shared ops shape and run renderer init via the builder entry
++    struct rutabaga_rv_bridge* ops = calloc(1, sizeof(*ops));
++    if (!ops) {
++        free(st);
++        dlclose(dl);
++        return false;
++    }
++    ops->dl = dl;
++    ops->init = vg_vg_init;
++    ops->finish = vg_vg_finish;
++    ops->get_num_capsets = vg_vg_get_num_capsets;
++    ops->get_capset_info = vg_vg_get_capset_info;
++    ops->get_capset = vg_vg_get_capset;
++    ops->context_create = vg_vg_context_create;
++    ops->context_destroy = vg_vg_context_destroy;
++    ops->context_attach_resource = vg_vg_context_attach_resource;
++    ops->context_detach_resource = vg_vg_context_detach_resource;
++    ops->resource_create_3d = vg_vg_resource_create_3d;
++    ops->resource_attach_backing = vg_vg_resource_attach_backing;
++    ops->resource_detach_backing = vg_vg_resource_detach_backing;
++    ops->resource_transfer_read = vg_vg_resource_transfer_read;
++    ops->resource_transfer_write = vg_vg_resource_transfer_write;
++    ops->resource_create_blob = vg_vg_resource_create_blob;
++    ops->resource_unref = vg_vg_resource_unref;
++    ops->resource_map = vg_vg_resource_map;
++    ops->resource_unmap = vg_vg_resource_unmap;
++    ops->resource_map_info = vg_vg_resource_map_info;
++    ops->submit_command = vg_vg_submit_command;
++    ops->create_fence = vg_vg_create_fence;
++
++    struct rutabaga_builder_rv builder = {
++        .user_data = (uint64_t)(uintptr_t)st,
++        .capset_mask = 0,
++        .wsi = 0,
++        .fence_cb = NULL,
++        .debug_cb = NULL,
++        .channels = NULL,
++        .renderer_features = NULL,
++    };
++    if (ops->init(&builder, &ops->rata) != 0 || !ops->rata) {
++        rvvm_warn("virtio-gpu: virglrenderer init failed");
++        free(ops);
++        free(st);
++        dlclose(dl);
++        return false;
++    }
++
++    vg->rtb = ops;
++    vg->g3d_kind = G3D_VIRGL;
++    // Advertise acceleration to the guest
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_VIRGL;
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_RESOURCE_BLOB;
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_CONTEXT_INIT;
++    rvvm_info("virtio-gpu: virglrenderer backend active (virgl:%d venus:%d)",
++              !!(want_mask & VG3D_VENUS), !!(want_mask & VG3D_VENUS));
+     return true;
+ }
+ #endif
+@@ -1572,6 +2184,123 @@ static size_t vg_handle_ctrl(virtio_gpu_dev_t* vg, const uint8_t* req, size_t re
+                 vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
+                 return resp->len;
+             }
++            case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: {
++                // struct virtio_gpu_resource_create_blob {
++                //   hdr; resource_id; blob_mem; blob_flags; nr_entries; blob_id u64; size u64;
++                //   mem_entries[nr_entries] }
++                struct {
++                    uint32_t resource_id;
++                    uint32_t blob_mem;
++                    uint32_t blob_flags;
++                    uint32_t nr_entries;
++                    uint64_t blob_id;
++                    uint64_t size;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                if (in.size == 0 || in.nr_entries > VIRTIO_GPU_MAX_IOVECS) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                    return resp->len;
++                }
++                size_t entries_off = sizeof(hdr) + sizeof(in);
++                if (req_len < entries_off + (size_t)in.nr_entries * 16) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                virtio_gpu_resource_t* res = vg_resource_alloc(vg, in.resource_id);
++                if (!res) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                res->is_3d = true;
++                res->blob = true;
++                res->blob_size = in.size;
++                // Hand guest backing (if any) to the backend
++                struct { void* base; size_t len; } vecs[VIRTIO_GPU_MAX_IOVECS];
++                struct { void* vecs; size_t count; } iovecs = { vecs, in.nr_entries };
++                for (uint32_t i = 0; i < in.nr_entries; ++i) {
++                    virtio_gpu_mem_entry_t ent;
++                    memcpy(&ent, req + entries_off + (size_t)i * 16, sizeof(ent));
++                    vecs[i].base = virtio_gpu_dma_ptr(vg, ent.addr, ent.length);
++                    vecs[i].len = ent.length;
++                }
++                // struct rutabaga_create_blob {blob_mem u32, blob_flags u32, blob_id u64, size u64}
++                struct {
++                    uint32_t blob_mem;
++                    uint32_t blob_flags;
++                    uint64_t blob_id;
++                    uint64_t size;
++                } cb = { in.blob_mem, in.blob_flags, in.blob_id, in.size };
++                if (vg->rtb->resource_create_blob(vg->rtb->rata, hdr.ctx_id, in.resource_id, &cb,
++                                                  in.nr_entries ? &iovecs : NULL, NULL) != 0) {
++                    vg_resource_unref(vg, res);
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: {
++                // struct virtio_gpu_resource_map_blob { hdr; resource_id; padding }
++                struct {
++                    uint32_t resource_id;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++                if (!res || !res->blob) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                // struct rutabaga_mapping { u64 ptr; u64 size; }
++                uint64_t mapping[2] = {0, 0};
++                if (vg->rtb->resource_map(vg->rtb->rata, in.resource_id, mapping) != 0) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                res->blob_map = (void*)(uintptr_t)mapping[0];
++                res->blob_map_size = mapping[1];
++                uint32_t map_info = VIRTIO_GPU_MAP_CACHE_WC;
++                (void)vg->rtb->resource_map_info(vg->rtb->rata, in.resource_id, &map_info);
++                // struct virtio_gpu_resp_map_blob { hdr; map_info u32; padding u32; offset u64 }
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_MAP_INFO, &hdr);
++                uint32_t pad32 = 0;
++                uint64_t offset = 0;
++                vg_resp_put(resp, &map_info, 4);
++                vg_resp_put(resp, &pad32, 4);
++                vg_resp_put(resp, &offset, 8);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: {
++                // struct virtio_gpu_resource_unmap_blob { hdr; resource_id; map_info; padding }
++                struct {
++                    uint32_t resource_id;
++                    uint32_t map_info;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++                if (!res || !res->blob) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                (void)vg->rtb->resource_unmap(vg->rtb->rata, in.resource_id);
++                res->blob_map = NULL;
++                res->blob_map_size = 0;
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
+             case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: {
+                 // hdr + box{x,y,z,w,h,d} + offset + resource_id + level + stride + layer_stride
+                 struct {
+@@ -2296,3 +3025,33 @@ PUBLIC bool virtio_gpu_init_rutabaga(rvvm_mmio_dev_t* dev, const char* libpath)
+     return false;
+ #endif
+ }
++
++PUBLIC bool virtio_gpu_init_virgl(rvvm_mmio_dev_t* dev, const char* libpath, uint32_t backend_mask)
++{
++    if (!dev || !dev->data || dev->type != &virtio_gpu_type) {
++        return false;
++    }
++#ifdef VIRGL_BRIDGE
++    virtio_gpu_dev_t* vg = dev->data;
++    if (vg->rtb) {
++        return true;
++    }
++    if (vg->status != 0) {
++        rvvm_warn("virtio-gpu: cannot attach virglrenderer after driver init");
++        return false;
++    }
++    if (backend_mask == 0) {
++        backend_mask = VG3D_VIRGL | VG3D_VENUS;
++    }
++    bool ok = vg_virgl_load(vg, libpath, backend_mask);
++    if (ok) {
++        vg->config_generation++;
++    }
++    return ok;
++#else
++    UNUSED(dev);
++    UNUSED(libpath);
++    UNUSED(backend_mask);
++    return false;
++#endif
++}
+diff --git a/src/devices/virtio-gpu.h b/src/devices/virtio-gpu.h
+index 3366ad8..dc478eb 100644
+--- a/src/devices/virtio-gpu.h
++++ b/src/devices/virtio-gpu.h
+@@ -42,4 +42,19 @@ PUBLIC size_t virtio_gpu_get_cursor_bitmap(rvvm_mmio_dev_t* dev, uint32_t width,
+  */
+ PUBLIC bool virtio_gpu_init_rutabaga(rvvm_mmio_dev_t* dev, const char* libpath);
+ 
++/*
++ * 3D backend selection bits for virtio_gpu_init_virgl()
++ */
++#define VIRTIO_GPU_3D_BACKEND_VIRGL    0x1 /* virgl (GLES via virglrenderer) */
++#define VIRTIO_GPU_3D_BACKEND_VENUS    0x2 /* venus (Vulkan via virglrenderer; MoltenVK on iOS) */
++#define VIRTIO_GPU_3D_BACKEND_RUTABAGA 0x4 /* rutabaga (gfxstream) - see virtio_gpu_init_rutabaga */
++
++/*
++ * Attempt to initialize a virglrenderer backend hosting virgl and/or venus
++ * 3D contexts. Loads libvirglrenderer at runtime; on failure the device
++ * stays in 2D mode. backend_mask is a combination of the bits above
++ * (0 selects both VIRGL and VENUS).
++ */
++PUBLIC bool virtio_gpu_init_virgl(rvvm_mmio_dev_t* dev, const char* libpath, uint32_t backend_mask);
++
+ #endif
+diff --git a/src/main.c b/src/main.c
+index cf160db..943074a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -195,8 +195,10 @@ static void rvvm_print_help(void)
+         "    -nvme       ...  Explicitly attach storage image as NVMe device\n"
+         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
+         "    -virtio-fs  ...  Attach virtio-fs shared directory (tag: share)\n"
+-        "    -virtio_gpu ...  Use virtio-gpu paravirtual display (optionally WxH,\n"
+-        "                    optionally rutabaga[=lib] for host 3D acceleration)\n"
++        "    -virtio_gpu ...  Use virtio-gpu paravirtual display (optionally WxH)\n"
++        "                    with optional 3D backend: rutabaga[=lib] (gfxstream),\n"
++        "                    virgl (virglrenderer GL), venus (virglrenderer Vulkan),\n"
++        "                    virgl:venus (both), none (2D only)\n"
+         "    -nogui           Disable display GUI\n"
+         "    -nogpu           Disable GPU\n"
+         "    -nosound         Disable sound support\n"
+@@ -447,10 +449,26 @@ static int rvvm_cli_main(int argc, char** argv)
+             gui_window_t* win = gui_rvvm_init(0, NULL, machine);
+             rvvm_fbdev_t* gpu_fbdev = gui_window_get_fbdev(win);
+             rvvm_mmio_dev_t* vgpu = virtio_gpu_init_auto(machine, gpu_fbdev, gpu_w, gpu_h);
+-            if (vgpu && gpu_arg && strstr(gpu_arg, "rutabaga")) {
+-                const char* eq = strstr(gpu_arg, "rutabaga=");
+-                if (!virtio_gpu_init_rutabaga(vgpu, eq ? eq + 9 : NULL)) {
+-                    rvvm_warn("virtio-gpu: continuing in 2D mode (no rutabaga backend)");
++            if (vgpu && gpu_arg) {
++                const char* backend = strchr(gpu_arg, ':');
++                backend = backend ? backend + 1 : gpu_arg;
++                if (strstr(backend, "rutabaga")) {
++                    const char* eq = strstr(backend, "rutabaga=");
++                    if (!virtio_gpu_init_rutabaga(vgpu, eq ? eq + 9 : NULL)) {
++                        rvvm_warn("virtio-gpu: continuing in 2D mode (no rutabaga backend)");
++                    }
++                } else if (strstr(backend, "virgl") || strstr(backend, "venus")) {
++                    uint32_t mask = 0;
++                    if (strstr(backend, "virgl")) {
++                        mask |= VIRTIO_GPU_3D_BACKEND_VIRGL;
++                    }
++                    if (strstr(backend, "venus")) {
++                        mask |= VIRTIO_GPU_3D_BACKEND_VENUS;
++                    }
++                    const char* eq = strchr(backend, '=');
++                    if (!virtio_gpu_init_virgl(vgpu, eq ? eq + 1 : NULL, mask)) {
++                        rvvm_warn("virtio-gpu: continuing in 2D mode (no virglrenderer backend)");
++                    }
+                 }
+             }
+         } else {
+-- 
+2.39.5
+

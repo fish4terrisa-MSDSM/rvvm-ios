@@ -13,3 +13,10 @@ DerivedData/
 
 .DS_Store
 Thumbs.db
+
+# build-time prepared upstream tree
+external/
+
+# local recovery/download scratch (kept out of git)
+.recovered/
+google_drive/

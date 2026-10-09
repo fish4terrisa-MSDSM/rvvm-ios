@@ -1,0 +1,26 @@
+From 3643e2abd57f1c8dfed34972b3fb64f6ddc47497 Mon Sep 17 00:00:00 2001
+From: rvvm-ios <rvvm-ios@local>
+Date: Fri, 9 Oct 2026 05:42:02 +0000
+Subject: [PATCH 6/9] virtio-gpu: fix const-cast warning in rutabaga submit
+ bridge
+
+---
+ src/devices/virtio-gpu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/devices/virtio-gpu.c b/src/devices/virtio-gpu.c
+index 790c562..fb25559 100644
+--- a/src/devices/virtio-gpu.c
++++ b/src/devices/virtio-gpu.c
+@@ -1551,7 +1551,7 @@ static size_t vg_handle_ctrl(virtio_gpu_dev_t* vg, const uint8_t* req, size_t re
+                 } cmd = {
+                     .ctx_id = hdr.ctx_id,
+                     .cmd_size = in.size,
+-                    .cmd = (uint8_t*)req + sizeof(hdr) + 8,
++                    .cmd = (uint8_t*)(uintptr_t)(const void*)req + sizeof(hdr) + 8,
+                     .pad1 = 0,
+                     .pad2 = NULL,
+                 };
+-- 
+2.39.5
+

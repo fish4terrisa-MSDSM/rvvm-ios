@@ -1,0 +1,228 @@
+From 374dba4a72327261816690800c3a2c6373896a57 Mon Sep 17 00:00:00 2001
+From: rvvm-ios <rvvm-ios@local>
+Date: Fri, 9 Oct 2026 05:08:31 +0000
+Subject: [PATCH 3/9] net: tap_reinit for usermode & Linux TAP, error-code
+ net_udp_send; fb: is_headless; bochs: snapshot suspend
+
+- tap_reinit() drops connections & reinitializes backend (iOS network resume)
+- Persist port-forwarding rules across tap reinit
+- net_udp_send()/net_icmp_send() report error codes, hard errors close sockets
+- ICMP socket mapping keeps the echo id as port
+- rvvm_fbdev_is_headless() public query
+- bochs-display: snapshot suspend/resume (VRAM + display regs)
+- blk_io: stdio.h for SEEK_* on Darwin
+- isolation: bypass when host filesystem sharing (virtio-fs) is active
+---
+ include/rvvm/rvvm_fb.h      |  5 +++++
+ src/core/rvvm_fbdev.c       |  5 +++++
+ src/core/rvvm_isolation.c   | 11 ++++++++++
+ src/devices/bochs-display.c | 43 ++++++++++++++++++++++++++++++++++---
+ src/util/blk_io.c           |  1 +
+ src/util/networking.c       |  9 ++++----
+ src/util/networking.h       |  4 ++--
+ 7 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/include/rvvm/rvvm_fb.h b/include/rvvm/rvvm_fb.h
+index b124a65..64c836a 100644
+--- a/include/rvvm/rvvm_fb.h
++++ b/include/rvvm/rvvm_fb.h
+@@ -301,6 +301,11 @@ RVVM_PUBLIC void rvvm_fbdev_set_display_data(rvvm_fbdev_t* fbdev, void* data);
+  */
+ RVVM_PUBLIC void* rvvm_fbdev_get_display_data(rvvm_fbdev_t* fbdev);
+ 
++/**
++ * Check whether the framebuffer device has no display attached (headless)
++ */
++RVVM_PUBLIC bool rvvm_fbdev_is_headless(rvvm_fbdev_t* fbdev);
++
+ /**
+  * Set fbdev video RAM buffer & size. Must be done before passing fbdev to the GPU device.
+  */
+diff --git a/src/core/rvvm_fbdev.c b/src/core/rvvm_fbdev.c
+index ed0b00e..6b10021 100644
+--- a/src/core/rvvm_fbdev.c
++++ b/src/core/rvvm_fbdev.c
+@@ -115,6 +115,11 @@ RVVM_PUBLIC void* rvvm_fbdev_get_display_data(rvvm_fbdev_t* fbdev)
+     return fbdev ? fbdev->display_data : NULL;
+ }
+ 
++RVVM_PUBLIC bool rvvm_fbdev_is_headless(rvvm_fbdev_t* fbdev)
++{
++    return !fbdev || !fbdev->display_cb;
++}
++
+ RVVM_PUBLIC bool rvvm_fbdev_set_vram(rvvm_fbdev_t* fbdev, void* vram, size_t size)
+ {
+     if (fbdev) {
+diff --git a/src/core/rvvm_isolation.c b/src/core/rvvm_isolation.c
+index c61070d..ad67221 100644
+--- a/src/core/rvvm_isolation.c
++++ b/src/core/rvvm_isolation.c
+@@ -16,6 +16,11 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ 
+ PUSH_OPTIMIZATION_SIZE
+ 
++__attribute__((weak)) bool virtio_fs_hostfs_enabled(void)
++{
++    return false;
++}
++
+ // Do not isolate under sanitizers to prevent breakage
+ #if !defined(SANITIZERS_ENABLED)
+ 
+@@ -858,6 +863,9 @@ static void restrict_process_once(void)
+ 
+ void rvvm_restrict_this_thread(void)
+ {
++    if (virtio_fs_hostfs_enabled()) {
++        return;
++    }
+ #if defined(ISOLATION_DROP_ROOT_IMPL)
+     drop_root_user();
+ #endif
+@@ -872,6 +880,9 @@ void rvvm_restrict_this_thread(void)
+ 
+ PUBLIC void rvvm_restrict_process(void)
+ {
++    if (virtio_fs_hostfs_enabled()) {
++        return;
++    }
+     DO_ONCE(restrict_process_once());
+ }
+ 
+diff --git a/src/devices/bochs-display.c b/src/devices/bochs-display.c
+index 042d772..2cb70fc 100644
+--- a/src/devices/bochs-display.c
++++ b/src/devices/bochs-display.c
+@@ -232,10 +232,46 @@ static void bochs_display_poll(rvvm_reg_dev_t* dev)
+     rvvm_fbdev_update(disp->fbdev);
+ }
+ 
++static void bochs_vram_suspend(rvvm_reg_dev_t* dev, rvvm_snapshot_t* snap, bool resume)
++{
++    if (snap) {
++        bochs_display_t* disp = rvvm_region_data(dev);
++        rvvm_reg_desc_t desc  = ZERO_INIT;
++        rvvm_region_get_desc(dev, &desc);
++        if (desc.mmap && desc.size && !rvvm_fbdev_is_headless(disp->fbdev)) {
++            rvvm_snapshot_section(snap, "bochs-vram");
++            rvvm_snapshot_data(snap, desc.mmap, desc.size);
++        }
++    }
++    UNUSED(resume);
++}
++
++static void bochs_display_suspend(rvvm_reg_dev_t* dev, rvvm_snapshot_t* snap, bool resume)
++{
++    bochs_display_t* disp = rvvm_region_data(dev);
++
++    if (snap) {
++        rvvm_snapshot_section(snap, "bochs-display");
++        rvvm_snapshot_field(snap, disp->version);
++        rvvm_snapshot_field(snap, disp->enable);
++        rvvm_snapshot_field(snap, disp->xres);
++        rvvm_snapshot_field(snap, disp->yres);
++        rvvm_snapshot_field(snap, disp->xvirt);
++        rvvm_snapshot_field(snap, disp->yvirt);
++        rvvm_snapshot_field(snap, disp->xoff);
++        rvvm_snapshot_field(snap, disp->yoff);
++    } else if (resume) {
++        bochs_display_update_mode(disp, !!(disp->enable & BOCHS_ENABLE));
++        rvvm_fbdev_dirty(disp->fbdev);
++    }
++}
++
+ static const rvvm_reg_type_t bochs_vram_type = {
+-    .name    = "bochs-vram",
+-    .write   = bochs_vram_write,
+-    .cleanup = bochs_display_cleanup,
++    .name     = "bochs-vram",
++    .write    = bochs_vram_write,
++    .poll     = bochs_display_poll,
++    .suspend  = bochs_vram_suspend,
++    .cleanup  = bochs_display_cleanup,
+ };
+ 
+ static const rvvm_reg_type_t bochs_display_type = {
+@@ -243,6 +279,7 @@ static const rvvm_reg_type_t bochs_display_type = {
+     .read     = bochs_display_read,
+     .write    = bochs_display_write,
+     .poll     = bochs_display_poll,
++    .suspend  = bochs_display_suspend,
+     .cleanup  = bochs_display_cleanup,
+     .min_size = 2,
+     .max_size = 2,
+diff --git a/src/util/blk_io.c b/src/util/blk_io.c
+index 4e27552..43831e8 100644
+--- a/src/util/blk_io.c
++++ b/src/util/blk_io.c
+@@ -28,6 +28,7 @@ PUSH_OPTIMIZATION_SIZE
+ // Threaded POSIX 1003.1-2001 file implementation using pread() / pwrite()
+ #include <errno.h>  // For errno
+ #include <fcntl.h>  // For struct flock, open(), fcntl(), posix_fallocate(), fallocate(), fspacectl(), fdiscard()
++#include <stdio.h>  // For SEEK_SET, SEEK_END
+ #include <unistd.h> // For close(), lseek(), pread(), pwrite(), fdatasync(), ftruncate()
+ 
+ #if defined(HOST_TARGET_NETBSD)
+diff --git a/src/util/networking.c b/src/util/networking.c
+index d8a865f..9378abd 100644
+--- a/src/util/networking.c
++++ b/src/util/networking.c
+@@ -1087,7 +1087,7 @@ net_sock_t* net_udp_bind(const net_addr_t* addr)
+     return NULL;
+ }
+ 
+-size_t net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr)
++int32_t net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr)
+ {
+     if (likely(sock)) {
+         int ret = 0;
+@@ -1102,11 +1102,12 @@ size_t net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net
+             ret = sendto(sock->fd, buffer, size, 0, (struct sockaddr*)&sock_addr, sizeof(sock_addr));
+ #endif
+         }
+-        if (ret > 0) {
++        if (ret >= 0) {
+             return ret;
+         }
++        return net_last_error();
+     }
+-    return 0;
++    return NET_ERR_RESET;
+ }
+ 
+ int32_t net_udp_recv(net_sock_t* sock, void* buffer, size_t size, net_addr_t* addr)
+@@ -1173,7 +1174,7 @@ net_sock_t* net_icmp_bind(const net_addr_t* addr)
+     return NULL;
+ }
+ 
+-size_t net_icmp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr)
++int32_t net_icmp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr)
+ {
+     return net_udp_send(sock, buffer, size, addr);
+ }
+diff --git a/src/util/networking.h b/src/util/networking.h
+index 9fc9f27..a07b755 100644
+--- a/src/util/networking.h
++++ b/src/util/networking.h
+@@ -73,7 +73,7 @@ int32_t net_tcp_recv(net_sock_t* sock, void* buffer, size_t size);
+ 
+ net_sock_t* net_udp_bind(const net_addr_t* addr);
+ 
+-size_t  net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr);
++int32_t net_udp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr);
+ int32_t net_udp_recv(net_sock_t* sock, void* buffer, size_t size, net_addr_t* addr);
+ 
+ // ICMP Datagram Sockets (Optional)
+@@ -81,7 +81,7 @@ int32_t net_udp_recv(net_sock_t* sock, void* buffer, size_t size, net_addr_t* ad
+ net_sock_t* net_icmp_bind(const net_addr_t* addr);
+ uint16_t    net_icmp_id(net_sock_t* sock);
+ 
+-size_t  net_icmp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr);
++int32_t net_icmp_send(net_sock_t* sock, const void* buffer, size_t size, const net_addr_t* addr);
+ int32_t net_icmp_recv(net_sock_t* sock, void* buffer, size_t size, net_addr_t* addr);
+ 
+ // Generic socket operations
+-- 
+2.39.5
+

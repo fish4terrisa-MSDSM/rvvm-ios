@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Item 9: allow the VM to allocate more RAM than the default
+	     (~1.5-2 GB) limit. Works with free developer signing when the
+	     signer preserves embedded entitlements (ldid / SideStore / TrollStore);
+	     otherwise iOS silently falls back to the standard limit. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+
+	<!-- Item 6: JIT support. RVVM requests RWX pages; with any of these
+	     entitlements (or a JIT debugger such as StikDebug attaching and
+	     setting CS_DEBUGGED) the JIT comes up. Without them RVVM falls back
+	     to the interpreter on its own - the app NEVER disables the JIT. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Development-style signing: lets JIT enablers / debuggers attach -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
+</dict>
+</plist>

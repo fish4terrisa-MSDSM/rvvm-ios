@@ -56,6 +56,14 @@ static std::atomic<uint32_t> s_fb_stride(0);
 static std::atomic<uint32_t> s_fb_format(0);
 static std::atomic<uint32_t> s_fb_offset(0);
 
+#import "RV64FileStore.h"
+
+NSString *const RV64DefaultsAttachments = @"rvvm.attachments";
+NSString *const RV64DefaultsFirmware = @"rvvm.firmware";
+NSString *const RV64DefaultsShares = @"rvvm.shares";
+NSString *const RV64DefaultsGPUBackend = @"rvvm.gpuBackend";
+NSString *const RV64DefaultsBackgroundMode = @"rvvm.backgroundMode";
+
 static NSString *const kRVVMDefaultsBootMode = @"rvvm.bootMode";
 static NSString *const kRVVMDefaultsCores = @"rvvm.cores";
 static NSString *const kRVVMDefaultsRamMB = @"rvvm.ramMB";
@@ -82,6 +90,8 @@ static void PostUARTText(const std::string& s)
 	if (!text || text.length == 0) {
 		return;
 	}
+	// Mirror to Documents/logs/uart.log (visible in the Files app)
+	[[RV64FileStore shared] appendLog:text toFile:@"uart.log"];
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[[NSNotificationCenter defaultCenter] postNotificationName:RV64RunnerUARTTextNotification object:text userInfo:nil];
 	});
@@ -645,18 +655,87 @@ static bool ReadRvvmSnapshotHeader(const std::string& path, RvvmSnapshotHeader* 
 	return true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Boot attachments: {category: "disks"|"isos", file: name, readonly: bool,
+ *                    boot: bool}
+ * ------------------------------------------------------------------------- */
+struct RVVMAttachment {
+	std::string category;
+	std::string filename;
+	bool readonly;
+	bool boot;
+};
+
+static std::vector<RVVMAttachment> LoadAttachments()
+{
+	std::vector<RVVMAttachment> out;
+	@autoreleasepool {
+		NSArray *arr = (NSArray *)[NSUserDefaults.standardUserDefaults objectForKey:RV64DefaultsAttachments];
+		if ([arr isKindOfClass:[NSArray class]]) {
+			for (id item in arr) {
+				if (![item isKindOfClass:[NSDictionary class]]) {
+					continue;
+				}
+				NSDictionary *d = (NSDictionary *)item;
+				NSString *cat = [d objectForKey:@"category"];
+				NSString *file = [d objectForKey:@"file"];
+				if (![cat isKindOfClass:[NSString class]] || ![file isKindOfClass:[NSString class]] || file.length == 0) {
+					continue;
+				}
+				RVVMAttachment a;
+				a.category = UTF8FromNSString(cat);
+				a.filename = UTF8FromNSString(file);
+				id ro = [d objectForKey:@"readonly"];
+				a.readonly = [ro isKindOfClass:[NSNumber class]] ? [ro boolValue] : false;
+				id boot = [d objectForKey:@"boot"];
+				a.boot = [boot isKindOfClass:[NSNumber class]] ? [boot boolValue] : false;
+				out.push_back(a);
+			}
+		}
+		if (out.empty()) {
+			// Migrate legacy single-ISO/single-disk settings
+			NSString *isoFilename = [NSUserDefaults.standardUserDefaults stringForKey:kRVVMDefaultsIsoFilename];
+			NSString *diskFilename = [NSUserDefaults.standardUserDefaults stringForKey:kRVVMDefaultsDiskFilename];
+			if (diskFilename.length > 0) {
+				RVVMAttachment a;
+				a.category = "disks";
+				a.filename = UTF8FromNSString(diskFilename);
+				a.readonly = false;
+				a.boot = false;
+				out.push_back(a);
+			}
+			if (isoFilename.length > 0) {
+				RVVMAttachment a;
+				a.category = "isos";
+				a.filename = UTF8FromNSString(isoFilename);
+				a.readonly = true;
+				a.boot = true;
+				out.push_back(a);
+			}
+		}
+	}
+	return out;
+}
+
+static std::string ResolveAttachmentPath(const RVVMAttachment& a, const std::string& docsPathUTF8)
+{
+	[[RV64FileStore shared] ensureLayout];
+	NSString *cat = a.category == "isos" ? RV64FileStoreIsosDir : RV64FileStoreDisksDir;
+	NSString *file = NSStringFromUTF8String(a.filename);
+	if (!file) {
+		return {};
+	}
+	std::string p = UTF8FromNSString([[RV64FileStore shared] pathForCategory:cat filename:file]);
+	struct stat st;
+	return (stat(p.c_str(), &st) == 0) ? p : std::string();
+}
+
 static bool RunLinuxOnce()
 {
 	@autoreleasepool {
-		NSBundle *bundle = [NSBundle mainBundle];
 		NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-		RVVMBootMode bootMode = (RVVMBootMode)[defaults integerForKey:kRVVMDefaultsBootMode];
 		NSInteger cores = [defaults integerForKey:kRVVMDefaultsCores];
 		NSInteger ramMB = [defaults integerForKey:kRVVMDefaultsRamMB];
-		BOOL disableIso = [defaults boolForKey:kRVVMDefaultsDisableIso];
-		NSString *isoFilename = [defaults stringForKey:kRVVMDefaultsIsoFilename];
-		NSString *diskFilename = [defaults stringForKey:kRVVMDefaultsDiskFilename];
-		NSString *archImgFilename = [defaults stringForKey:kRVVMDefaultsArchImgFilename];
 		NSArray *portForwards = (NSArray *)[defaults objectForKey:kRVVMDefaultsPortForwards];
 		id vfsDbgObj = [defaults objectForKey:kRVVMDefaultsVirtioFSDebugToUART];
 		BOOL virtioFSDebugToUart = vfsDbgObj ? [defaults boolForKey:kRVVMDefaultsVirtioFSDebugToUART] : YES;
@@ -664,220 +743,124 @@ static bool RunLinuxOnce()
 		BOOL autoLoadSnapshot = autoSnapObj ? [defaults boolForKey:kRVVMDefaultsAutoLoadSnapshot] : YES;
 		s_vfs_debug_to_uart.store(virtioFSDebugToUart);
 
-		NSArray<NSString *> *docsDirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-		NSString *docsDirPath = (docsDirs.count > 0) ? [docsDirs objectAtIndex:0] : nil;
+		[[RV64FileStore shared] ensureLayout];
+		NSString *docsDirPath = [[RV64FileStore shared] documentsPath];
 		std::string docsPathUTF8 = UTF8FromNSString(docsDirPath);
 		if (!docsPathUTF8.empty() && docsPathUTF8.back() == '/') {
 			docsPathUTF8.pop_back();
 		}
 
-		auto DocsFilePathIfExists = [&](NSString *filename) -> std::string {
-			if (docsPathUTF8.empty() || filename.length == 0) {
-				return {};
-			}
-			std::string name = UTF8FromNSString(filename);
-			if (name.empty()) {
-				return {};
-			}
-			std::string p = docsPathUTF8 + "/" + name;
+		/* ---------------- firmware (item 10) ---------------- */
+		NSString *fwName = [defaults stringForKey:RV64DefaultsFirmware];
+		std::string biosPath;
+		if (fwName.length > 0 && ![fwName isEqualToString:@"bundled"]) {
+			biosPath = UTF8FromNSString([[RV64FileStore shared] firmwarePath:fwName]);
 			struct stat st;
-			if (stat(p.c_str(), &st) != 0) {
-				return {};
+			if (stat(biosPath.c_str(), &st) != 0) {
+				PostUARTText("rvvm: selected firmware missing, falling back to bundled\n");
+				biosPath.clear();
 			}
-			return p;
-		};
-
-		auto DocsFilePath = [&](NSString *filename) -> std::string {
-			if (docsPathUTF8.empty() || filename.length == 0) {
-				return {};
+		}
+		if (biosPath.empty()) {
+			NSBundle *bundle = [NSBundle mainBundle];
+			NSURL *fwPayloadURL = [bundle URLForResource:@"fw_payload" withExtension:@"bin" subdirectory:@"rv64linux"];
+			NSURL *fwJumpURL = [bundle URLForResource:@"fw_jump" withExtension:@"bin" subdirectory:@"rv64linux"];
+			biosPath = fwPayloadURL ? FileSystemPath(fwPayloadURL) : std::string();
+			if (biosPath.empty() && fwJumpURL) {
+				biosPath = FileSystemPath(fwJumpURL);
 			}
-			std::string name = UTF8FromNSString(filename);
-			if (name.empty()) {
-				return {};
+		}
+		if (biosPath.empty()) {
+			PostUARTText("rvvm: no firmware available\n");
+			return false;
+		}
+
+		/* ---------------- attachments (items 2/3) ---------------- */
+		std::vector<RVVMAttachment> attachments = LoadAttachments();
+		// Paths
+		std::vector<RVVMAttachment> usable;
+		std::string bootIsoPath;
+		std::string bootDiskPath;
+		std::vector<std::pair<RVVMAttachment, std::string>> resolved;
+		for (const auto& a : attachments) {
+			std::string p = ResolveAttachmentPath(a, docsPathUTF8);
+			if (p.empty()) {
+				PostUARTText("rvvm: attachment missing: " + a.filename + "\n");
+				continue;
 			}
-			return docsPathUTF8 + "/" + name;
-		};
+			resolved.push_back({a, p});
+			if (a.category == "isos" && bootIsoPath.empty() && (a.boot || true)) {
+				// first ISO with boot flag wins; otherwise remember first ISO
+				if (a.boot) {
+					bootIsoPath = p;
+				} else if (bootIsoPath.empty()) {
+					// candidate, only used when no boot flag is set anywhere
+					if (bootIsoPath.empty()) {
+						bootIsoPath = p;
+					}
+				}
+			}
+			if (a.category == "disks" && bootDiskPath.empty()) {
+				bootDiskPath = p;
+			}
+		}
+		// Prefer explicitly booted ISO: recompute with flag priority
+		{
+			std::string flagged;
+			std::string firstIso;
+			std::string firstDisk;
+			for (const auto& [a, p] : resolved) {
+				if (a.category == "isos") {
+					if (firstIso.empty()) {
+						firstIso = p;
+					}
+					if (a.boot && flagged.empty()) {
+						flagged = p;
+					}
+				} else if (firstDisk.empty()) {
+					firstDisk = p;
+				}
+			}
+			bootIsoPath = !flagged.empty() ? flagged : firstIso;
+			bootDiskPath = firstDisk;
+		}
 
-		NSURL *fwPayloadURL = [bundle URLForResource:@"fw_payload" withExtension:@"bin" subdirectory:@"rv64linux"];
-		NSURL *alpineIsoURL = [bundle URLForResource:@"alpine-standard-3.23.3-riscv64" withExtension:@"iso" subdirectory:@"rv64linux"];
-		NSURL *alpineDiskSeedURL = [bundle URLForResource:@"alpine-riscv64" withExtension:@"img" subdirectory:@"rv64linux"];
-		NSURL *archImgURL = [bundle URLForResource:@"archriscv-2026-01-07-4g" withExtension:@"img" subdirectory:@"rv64linux"];
-
+		// Snapshot header (for RAM sizing)
 		std::string snapPath = SnapshotFilePathUTF8();
 		RvvmSnapshotHeader snapHdr = {};
 		bool haveSnapHeader = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
 		bool haveSnap = haveSnapHeader && autoLoadSnapshot;
 
-		std::string isoPath;
-		if (!disableIso) {
-			isoPath = (isoFilename.length > 0) ? DocsFilePathIfExists(isoFilename) : FileSystemPath(alpineIsoURL);
-		}
-		bool isoPossible = (!disableIso) && (fwPayloadURL != nil) && !isoPath.empty();
-		std::string diskImgPath = DocsFilePathIfExists(diskFilename);
-		bool diskImgPossible = (diskFilename.length > 0) && !diskImgPath.empty();
-		bool archPossible = (fwPayloadURL != nil) && (diskImgPossible || (archImgFilename.length > 0 && !DocsFilePathIfExists(archImgFilename).empty()) || (archImgURL != nil));
-
-		BOOL useIso = NO;
-		BOOL useArchImage = NO;
-		switch (bootMode) {
-			case RVVMBootModeAlpine:
-				if (!isoPossible) {
-					PostUARTText("rvvm: alpine ISO disabled or missing\n");
-					return false;
-				}
-				useIso = YES;
+		// Auto-create an install disk when booting an ISO with no writable disk
+		bool hasWritableDisk = false;
+		for (const auto& [a, p] : resolved) {
+			if (a.category == "disks" && !a.readonly) {
+				hasWritableDisk = true;
 				break;
-			case RVVMBootModeArch:
-				if (!archPossible) {
-					PostUARTText("rvvm: arch image missing\n");
-					return false;
-				}
-				useArchImage = YES;
-				break;
-			case RVVMBootModeCustom:
-				if (isoPossible) {
-					useIso = YES;
-				} else if (archPossible) {
-					useArchImage = YES;
-				} else {
-					PostUARTText("rvvm: no bootable image (ISO disabled/missing and no disk image)\n");
-					return false;
-				}
-				break;
-			case RVVMBootModeAuto:
-			default:
-				if (isoPossible) {
-					useIso = YES;
-				} else if (archPossible) {
-					useArchImage = YES;
-				} else {
-					PostUARTText("rvvm: no bootable image (ISO disabled/missing and no disk image)\n");
-					return false;
-				}
-				break;
-		}
-
-		NSURL *biosURL = fwPayloadURL;
-		if (!biosURL || (!useIso && !useArchImage)) {
-			PostUARTText("rvvm: missing boot resources\n");
-			return false;
-		}
-
-		std::string biosPath = FileSystemPath(biosURL);
-		std::string imagePath;
-		std::string installDiskPath;
-		if (useArchImage) {
-			if (diskImgPossible) {
-				imagePath = diskImgPath;
-			} else if (archImgFilename.length > 0) {
-				imagePath = DocsFilePathIfExists(archImgFilename);
-				if (imagePath.empty()) {
-					PostUARTText("rvvm: arch image missing\n");
-					return false;
-				}
-			} else {
-				if (haveSnap) {
-					PostUARTText("rvvm: snapshot load requires existing disk image\n");
-					return false;
-				}
-				if (docsDirPath.length == 0 || docsPathUTF8.empty()) {
-					PostUARTText("rvvm: missing documents dir\n");
-					return false;
-				}
-				std::string dstPathUTF8 = docsPathUTF8 + "/archriscv-2026-01-07-4g.img";
-				CFStringRef cfDstPath = CFStringCreateWithCString(kCFAllocatorDefault, dstPathUTF8.c_str(), kCFStringEncodingUTF8);
-				NSString *dstPath = cfDstPath ? (__bridge_transfer NSString *)cfDstPath : nil;
-				if (!dstPath) {
-					PostUARTText("rvvm: disk image dst path failed\n");
-					return false;
-				}
-
-				if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
-					std::string srcPath = FileSystemPath(archImgURL);
-					if (srcPath.empty()) {
-						PostUARTText("rvvm: disk image missing path\n");
-						return false;
-					}
-					CFStringRef cfSrcPath = CFStringCreateWithCString(kCFAllocatorDefault, srcPath.c_str(), kCFStringEncodingUTF8);
-					NSString *srcPathStr = cfSrcPath ? (__bridge_transfer NSString *)cfSrcPath : nil;
-					if (!srcPathStr) {
-						PostUARTText("rvvm: disk image src path failed\n");
-						return false;
-					}
-					NSError *err = nil;
-					if (![[NSFileManager defaultManager] copyItemAtPath:srcPathStr toPath:dstPath error:&err]) {
-						PostUARTText("rvvm: disk image copy failed\n");
-						return false;
-					}
-				}
-				imagePath = dstPathUTF8;
 			}
 		}
-		if (useIso) {
-			if (isoPath.empty()) {
-				PostUARTText("rvvm: iso path failed\n");
+		std::string autoInstallDiskPath;
+		if (!bootIsoPath.empty() && !hasWritableDisk) {
+			autoInstallDiskPath = UTF8FromNSString([[RV64FileStore shared] diskPath:@"install.img"]);
+			size_t diskSize = 0;
+			if (!EnsureSparseRawImage(autoInstallDiskPath, (size_t)(1ULL << 30), &diskSize)) {
+				PostUARTText("rvvm: install disk create failed\n");
 				return false;
 			}
-			if (docsDirPath.length == 0 || docsPathUTF8.empty()) {
-				PostUARTText("rvvm: missing documents dir\n");
-				return false;
-			}
-			installDiskPath = (diskFilename.length > 0) ? DocsFilePath(diskFilename) : (docsPathUTF8 + "/alpine-riscv64.img");
-
-			CFStringRef cfInstallDiskPath = CFStringCreateWithCString(kCFAllocatorDefault, installDiskPath.c_str(), kCFStringEncodingUTF8);
-			NSString *installDiskPathStr = cfInstallDiskPath ? (__bridge_transfer NSString *)cfInstallDiskPath : nil;
-			if (!installDiskPathStr) {
-				PostUARTText("rvvm: install disk path failed\n");
-				return false;
-			}
-			if (!haveSnap && diskFilename.length == 0 && ![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
-				std::string seedPath = FileSystemPath(alpineDiskSeedURL);
-				if (!seedPath.empty()) {
-					CFStringRef cfSeedPath = CFStringCreateWithCString(kCFAllocatorDefault, seedPath.c_str(), kCFStringEncodingUTF8);
-					NSString *seedPathStr = cfSeedPath ? (__bridge_transfer NSString *)cfSeedPath : nil;
-					if (seedPathStr) {
-						NSError *err = nil;
-						if (![[NSFileManager defaultManager] copyItemAtPath:seedPathStr toPath:installDiskPathStr error:&err]) {
-							PostUARTText("rvvm: install disk seed copy failed\n");
-						}
-					}
-				}
-			}
-
-			if (!haveSnap) {
-				size_t diskSize = 0;
-				static const size_t sizes[] = {
-					(size_t)(1ULL << 30),
-				};
-
-				bool ok = false;
-				for (size_t s : sizes) {
-					if (EnsureSparseRawImage(installDiskPath, s, &diskSize)) {
-						ok = true;
-						break;
-					}
-				}
-				if (!ok) {
-					PostUARTText("rvvm: install disk create failed\n");
-					return false;
-				}
-			} else {
-				if (![[NSFileManager defaultManager] fileExistsAtPath:installDiskPathStr]) {
-					PostUARTText("rvvm: snapshot load requires existing install disk\n");
-					return false;
-				}
-			}
 		}
 
+		/* ---------------- memory / machine ---------------- */
 		size_t preferredMem = 0;
 		if (haveSnap) {
 			preferredMem = (size_t)snapHdr.mem_size;
 		} else if (ramMB > 0) {
 			preferredMem = (size_t)ramMB << 20;
 		} else {
-			preferredMem = useIso ? (size_t)(1ULL << 30) : (useArchImage ? (size_t)(2ULL << 30) : (size_t)(256ULL << 20));
+			preferredMem = bootIsoPath.empty() ? (size_t)(2ULL << 30) : (size_t)(1ULL << 30);
 		}
 		static const size_t fallbacks[] = {
+			(size_t)(4ULL << 30),
+			(size_t)(3ULL << 30),
 			(size_t)(2ULL << 30),
 			(size_t)(1536ULL << 20),
 			(size_t)(1024ULL << 20),
@@ -894,7 +877,7 @@ static bool RunLinuxOnce()
 		} else if (cores > 0) {
 			smp = (size_t)std::min<NSInteger>(8, std::max<NSInteger>(1, cores));
 		} else {
-			smp = useIso ? 2 : 1;
+			smp = bootIsoPath.empty() ? 1 : 2;
 		}
 
 		if (preferredMem != 0) {
@@ -903,7 +886,6 @@ static bool RunLinuxOnce()
 				chosenMem = preferredMem;
 			}
 		}
-
 		if (!machine) {
 			for (size_t candidate : fallbacks) {
 				if (candidate > preferredMem) {
@@ -920,7 +902,13 @@ static bool RunLinuxOnce()
 			PostUARTText("rvvm: rvvm_create_machine failed (RAM allocation)\n");
 			return false;
 		}
-		rvvm_set_opt(machine, RVVM_OPT_JIT, 0);
+
+		/* JIT: ALWAYS enabled. RVVM falls back to the interpreter on its own
+		 * when executable pages cannot be allocated (e.g. no JIT debugger or
+		 * entitlement is present). We never pass -nojit and never disable the
+		 * option: "weird" JIT-enable methods may be invisible to the app. */
+		rvvm_set_opt(machine, RVVM_OPT_JIT, 1);
+		rvvm_set_opt(machine, RVVM_OPT_JIT_CACHE, (size_t)(32ULL << 20));
 		rvvm_append_cmdline(machine, " console=ttyS0,115200 console=tty0 earlycon=sbi");
 
 		chardev_t* chardev = CreateUIKitChardev();
@@ -965,8 +953,40 @@ static bool RunLinuxOnce()
 			rvvm_fbdev_set_scanout(fbdev, &bootFb);
 		}
 		rvvm_fbdev_register_display(fbdev, &s_ios_display_cb);
-		(void)rvvm_simplefb_init_auto(machine, fbdev);
-		(void)rvvm_bochs_display_init(pci, fbdev);
+
+		/* ---------------- GPU (item 8) ---------------- */
+		NSString *gpuBackend = [defaults stringForKey:RV64DefaultsGPUBackend];
+		if (!gpuBackend) {
+			gpuBackend = @"none";
+		}
+		bool useVirtioGPU = ![gpuBackend isEqualToString:@"none"];
+		if (useVirtioGPU) {
+			rvvm_mmio_dev_t* vgpu = virtio_gpu_init_auto(machine, fbdev, 1280, 720);
+			if (!vgpu) {
+				PostUARTText("rvvm: virtio-gpu init failed, falling back to bochs\n");
+				useVirtioGPU = false;
+			} else {
+				bool ok = false;
+				if ([gpuBackend isEqualToString:@"rutabaga"]) {
+					ok = virtio_gpu_init_rutabaga(vgpu, NULL);
+				} else if ([gpuBackend isEqualToString:@"virgl"]) {
+					ok = virtio_gpu_init_virgl(vgpu, NULL, VIRTIO_GPU_3D_BACKEND_VIRGL);
+				} else if ([gpuBackend isEqualToString:@"venus"]) {
+					ok = virtio_gpu_init_virgl(vgpu, NULL, VIRTIO_GPU_3D_BACKEND_VENUS);
+				} else if ([gpuBackend isEqualToString:@"virgl-venus"]) {
+					ok = virtio_gpu_init_virgl(vgpu, NULL, VIRTIO_GPU_3D_BACKEND_VIRGL | VIRTIO_GPU_3D_BACKEND_VENUS);
+				}
+				if (!ok && ![gpuBackend isEqualToString:@"none"]) {
+					PostUARTText("rvvm: GPU 3D backend unavailable, continuing 2D-only\n");
+				} else {
+					PostUARTText("rvvm: GPU backend " + std::string([gpuBackend UTF8String]) + "\n");
+				}
+			}
+		}
+		if (!useVirtioGPU) {
+			(void)rvvm_simplefb_init_auto(machine, fbdev);
+			(void)rvvm_bochs_display_init(pci, fbdev);
+		}
 		(void)i2c_oc_init_auto(machine);
 
 		tap = tap_open();
@@ -999,45 +1019,114 @@ static bool RunLinuxOnce()
 				(void)tap_portfwd(tap, fwd.c_str());
 			}
 		}
-		if (useArchImage) {
-			if (!nvme_init_auto(machine, imagePath.c_str(), true)) {
-				PostUARTText("rvvm: nvme failed\n");
-				if (tap) {
-					tap_close(tap);
-				}
-				chardev_free(chardev);
-				rvvm_free_machine(machine);
-				(void)rvvm_fbdev_dec_ref(fbdev);
+
+		/* ---------------- disks: multiple attachments (item 3) ---------------- */
+		auto AttachDisk = [&](const std::string& path, bool readonly) -> bool {
+			rvvm_blk_dev_t* blk = rvvm_blk_open(path.c_str(), NULL, readonly ? RVVM_BLK_READ : RVVM_BLK_RW);
+			if (!blk) {
+				PostUARTText("rvvm: cannot open disk image\n");
 				return false;
 			}
+			if (!rvvm_nvme_init(machine, blk, -1)) {
+				PostUARTText("rvvm: nvme attach failed\n");
+				rvvm_blk_close(blk);
+				return false;
+			}
+			return true;
+		};
+
+		bool attachOk = true;
+		// Attach in order: boot ISO first so it becomes nvme0 when ISO-booting,
+		// then all disks (and any extra ISOs as read-only media).
+		if (!bootIsoPath.empty()) {
+			attachOk = AttachDisk(bootIsoPath, true);
 		}
-		if (useIso) {
-			if (!nvme_init_auto(machine, isoPath.c_str(), false)) {
-				PostUARTText("rvvm: nvme iso failed\n");
-				if (tap) {
-					tap_close(tap);
-				}
-				chardev_free(chardev);
-				rvvm_free_machine(machine);
-				(void)rvvm_fbdev_dec_ref(fbdev);
-				return false;
+		for (const auto& [a, p] : resolved) {
+			if (!attachOk) {
+				break;
 			}
-			if (!nvme_init_auto(machine, installDiskPath.c_str(), true)) {
-				PostUARTText("rvvm: nvme disk failed\n");
-				if (tap) {
-					tap_close(tap);
-				}
-				chardev_free(chardev);
-				rvvm_free_machine(machine);
-				(void)rvvm_fbdev_dec_ref(fbdev);
-				return false;
+			if (a.category == "isos" && p == bootIsoPath) {
+				continue;
 			}
+			attachOk = AttachDisk(p, true);
 		}
+		if (attachOk && !autoInstallDiskPath.empty()) {
+			attachOk = AttachDisk(autoInstallDiskPath, false);
+		}
+		for (const auto& [a, p] : resolved) {
+			if (!attachOk) {
+				break;
+			}
+			if (a.category != "disks") {
+				continue;
+			}
+			attachOk = AttachDisk(p, !a.readonly);
+		}
+		if (!attachOk) {
+			if (tap) {
+				tap_close(tap);
+			}
+			chardev_free(chardev);
+			rvvm_free_machine(machine);
+			(void)rvvm_fbdev_dec_ref(fbdev);
+			return false;
+		}
+
 		syscon_init_auto(machine);
 		rtc_goldfish_init_auto(machine);
 		ns16550a_init_auto(machine, chardev);
-		if (!docsPathUTF8.empty()) {
-			(void)virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str());
+
+		/* ---------------- virtio-fs shares (item 5) ---------------- */
+		NSArray *shares = (NSArray *)[defaults objectForKey:RV64DefaultsShares];
+		BOOL attachedShare = NO;
+		if ([shares isKindOfClass:[NSArray class]]) {
+			for (id item in shares) {
+				if (![item isKindOfClass:[NSDictionary class]]) {
+					continue;
+				}
+				NSDictionary *d = (NSDictionary *)item;
+				NSString *tag = [d objectForKey:@"tag"];
+				NSString *path = [d objectForKey:@"path"];
+				if (![tag isKindOfClass:[NSString class]] || ![path isKindOfClass:[NSString class]] || path.length == 0) {
+					continue;
+				}
+				// Persisted security-scoped bookmarks take priority
+				NSData *bm = [d objectForKey:@"bookmark"];
+				NSString *resolvedPath = path;
+				BOOL scoped = NO;
+				if ([bm isKindOfClass:[NSData class]]) {
+					BOOL stale = NO;
+					NSError *err = nil;
+					NSURL *url = [NSURL URLByResolvingBookmarkData:bm
+					                                       options:NSURLBookmarkResolutionWithSecurityScope
+					                                         relativeToURL:nil
+					                                   bookmarkDataIsStale:&stale
+					                                                 error:&err];
+					if (url) {
+						if ([url startAccessingSecurityScopedResource]) {
+							scoped = YES;
+						}
+						resolvedPath = url.path;
+					}
+				}
+				std::string dir = UTF8FromNSString(resolvedPath);
+				std::string tagUtf = UTF8FromNSString(tag);
+				if (!dir.empty() && !tagUtf.empty()) {
+					if (virtio_fs_init_auto(machine, tagUtf.c_str(), dir.c_str())) {
+						attachedShare = YES;
+						PostUARTText("rvvm: virtio-fs share '" + tagUtf + "' -> " + dir + "\n");
+					} else {
+						PostUARTText("rvvm: virtio-fs share failed: " + tagUtf + "\n");
+					}
+				}
+				(void)scoped; // security scope intentionally held for process lifetime
+			}
+		}
+		if (!attachedShare) {
+			// Default: share Documents/files so Files.app <-> guest sync works
+			if (!docsPathUTF8.empty()) {
+				(void)virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str());
+			}
 		}
 
 		if (!rvvm_load_firmware(machine, biosPath.c_str())) {
@@ -1081,7 +1170,18 @@ static bool RunLinuxOnce()
 			s_fb_stride.store(0, std::memory_order_relaxed);
 			s_fb_format.store(0, std::memory_order_relaxed);
 			s_fb_offset.store(0, std::memory_order_relaxed);
-			s_active_writable_disk_path = useIso ? installDiskPath : (useArchImage ? imagePath : std::string());
+			// Remember the primary writable disk for export/reference
+			std::string primaryWritable;
+			for (const auto& [a, p] : resolved) {
+				if (a.category == "disks" && !a.readonly) {
+					primaryWritable = p;
+					break;
+				}
+			}
+			if (primaryWritable.empty() && !autoInstallDiskPath.empty()) {
+				primaryWritable = autoInstallDiskPath;
+			}
+			s_active_writable_disk_path = primaryWritable;
 		}
 		rvvm_start_machine(machine);
 		for (;;) {
@@ -1705,6 +1805,160 @@ static bool RunLinuxOnce()
 		return;
 	}
 	hid_mouse_scroll_virtio(mouse, offset);
+}
+
+/* ---------------- touch input (item 13) ---------------- */
++ (void)sendTouchAtX:(float)x
+                   y:(float)y
+               phase:(NSInteger)phase
+            tapCount:(NSUInteger)tapCount
+{
+	// x, y are normalized (0..1) over the display surface.
+	hid_mouse_t* mouse = nullptr;
+	uint32_t resW = 0, resH = 0;
+	{
+		std::lock_guard<std::mutex> lock(s_state_mutex);
+		mouse = s_mouse_virtio;
+		resW = s_mouse_abs_width.load();
+		resH = s_mouse_abs_height.load();
+	}
+	if (!mouse) {
+		return;
+	}
+	if (resW == 0 || resH == 0) {
+		resW = s_fb_width.load();
+		resH = s_fb_height.load();
+	}
+	if (resW == 0 || resH == 0) {
+		resW = 1280;
+		resH = 720;
+	}
+	float cx = x < 0.f ? 0.f : (x > 1.f ? 1.f : x);
+	float cy = y < 0.f ? 0.f : (y > 1.f ? 1.f : y);
+	int32_t px = (int32_t)(cx * (float)(resW - 1));
+	int32_t py = (int32_t)(cy * (float)(resH - 1));
+
+	switch (phase) {
+		case 0: // begin: move + press
+			hid_mouse_place_virtio(mouse, px, py);
+			if (tapCount >= 2) {
+				// Double tap: double-click
+				hid_mouse_press_virtio(mouse, HID_BTN_LEFT);
+				hid_mouse_release_virtio(mouse, HID_BTN_LEFT);
+			}
+			hid_mouse_press_virtio(mouse, HID_BTN_LEFT);
+			break;
+		case 1: // move
+			hid_mouse_place_virtio(mouse, px, py);
+			break;
+		case 2: // end
+			hid_mouse_place_virtio(mouse, px, py);
+			hid_mouse_release_virtio(mouse, HID_BTN_LEFT);
+			break;
+		case 3: // cancel
+			hid_mouse_release_virtio(mouse, HID_BTN_LEFT | HID_BTN_RIGHT | HID_BTN_MIDDLE);
+			break;
+		case 4: // hover (no button) - for pointer-type gestures
+			hid_mouse_place_virtio(mouse, px, py);
+			break;
+		case 5: // right-click tap (two-finger tap)
+			hid_mouse_place_virtio(mouse, px, py);
+			hid_mouse_press_virtio(mouse, HID_BTN_RIGHT);
+			hid_mouse_release_virtio(mouse, HID_BTN_RIGHT);
+			break;
+		default:
+			break;
+	}
+}
+
+/* ---------------- boot attachment management (items 2/3) ---------------- */
++ (NSArray<NSDictionary *> *)attachments
+{
+	NSArray *arr = (NSArray *)[NSUserDefaults.standardUserDefaults objectForKey:RV64DefaultsAttachments];
+	if ([arr isKindOfClass:[NSArray class]]) {
+		return arr;
+	}
+	return @[];
+}
+
++ (void)setAttachments:(NSArray<NSDictionary *> *)attachments
+{
+	NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+	if (attachments.count > 0) {
+		[d setObject:attachments forKey:RV64DefaultsAttachments];
+	} else {
+		[d removeObjectForKey:RV64DefaultsAttachments];
+	}
+	[d synchronize];
+}
+
+/* ---------------- firmware (item 10) ---------------- */
++ (NSString *)selectedFirmware
+{
+	NSString *fw = [NSUserDefaults.standardUserDefaults stringForKey:RV64DefaultsFirmware];
+	return fw.length > 0 ? fw : @"bundled";
+}
+
++ (void)setSelectedFirmware:(NSString *)name
+{
+	NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+	if (name.length > 0) {
+		[d setObject:name forKey:RV64DefaultsFirmware];
+	} else {
+		[d removeObjectForKey:RV64DefaultsFirmware];
+	}
+	[d synchronize];
+}
+
+/* ---------------- virtio-fs shares (item 5) ---------------- */
++ (NSArray<NSDictionary *> *)shares
+{
+	NSArray *arr = (NSArray *)[NSUserDefaults.standardUserDefaults objectForKey:RV64DefaultsShares];
+	if ([arr isKindOfClass:[NSArray class]]) {
+		return arr;
+	}
+	return @[];
+}
+
++ (void)setShares:(NSArray<NSDictionary *> *)shares
+{
+	NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+	if (shares.count > 0) {
+		[d setObject:shares forKey:RV64DefaultsShares];
+	} else {
+		[d removeObjectForKey:RV64DefaultsShares];
+	}
+	[d synchronize];
+}
+
+/* ---------------- GPU backend (item 8) ---------------- */
++ (NSString *)gpuBackend
+{
+	NSString *b = [NSUserDefaults.standardUserDefaults stringForKey:RV64DefaultsGPUBackend];
+	return b.length > 0 ? b : @"none";
+}
+
++ (void)setGpuBackend:(NSString *)backend
+{
+	NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+	if (backend.length > 0) {
+		[d setObject:backend forKey:RV64DefaultsGPUBackend];
+	} else {
+		[d removeObjectForKey:RV64DefaultsGPUBackend];
+	}
+	[d synchronize];
+}
+
+/* ---------------- JIT ---------------- */
++ (BOOL)jitCompiledIn
+{
+#if defined(USE_JIT)
+	return YES;
+#else
+	// Even when the build probe fails, RVVM may still be JIT-capable; the
+	// runtime decides. We always request JIT and let RVVM fall back.
+	return YES;
+#endif
 }
 
 @end

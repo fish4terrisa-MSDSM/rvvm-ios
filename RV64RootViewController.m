@@ -1,5 +1,6 @@
 #import "RV64RootViewController.h"
 #import "RV64Runner.h"
+#import "RV64SettingsPages.h"
 
 #import <dispatch/dispatch.h>
 #import <QuartzCore/QuartzCore.h>
@@ -886,7 +887,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
 	(void)tableView;
-	return 4;
+	return 5;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
@@ -897,6 +898,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		case 1: return 2;
 		case 2: return self.docFiles.count + 2;
 		case 3: return 3;
+		case 4: return 7;
 	}
 	return 0;
 }
@@ -931,6 +933,7 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		case 1: return @"Hardware";
 		case 2: return @"Documents";
 		case 3: return @"Debug";
+		case 4: return @"VM";
 	}
 	return nil;
 }
@@ -1051,6 +1054,28 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		}
 		cell.textLabel.text = @"Virtio-FS debug log";
 		cell.detailTextLabel.text = @"View";
+		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+		cell.accessoryView = nil;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+		return cell;
+	}
+
+	if (indexPath.section == 4) {
+		static NSString *const kNames[] = {
+			@"Disks & ISOs", @"OpenSBI Firmware", @"Shared folders (virtio-fs)",
+			@"GPU backend", @"JIT", @"Background keep-alive", @"Files & Logs",
+		};
+		static NSString *const kDetails[] = {
+			@"Import, create, expand, sparsify, export",
+			@"Choose or import fw_payload / fw_jump",
+			@"Share folders into the guest",
+			@"2D only / rutabaga / virgl / venus",
+			@"StikDebug & fallback behaviour",
+			@"Toggle + keep-alive method",
+			@"Browse app storage and logs",
+		};
+		cell.textLabel.text = kNames[indexPath.row];
+		cell.detailTextLabel.text = kDetails[indexPath.row];
 		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 		cell.accessoryView = nil;
 		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -1497,6 +1522,22 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	if (indexPath.section == 3 && indexPath.row == 2) {
 		RV64VirtioFSDebugViewController *vc = [RV64VirtioFSDebugViewController new];
 		[self.navigationController pushViewController:vc animated:YES];
+		return;
+	}
+	if (indexPath.section == 4) {
+		UIViewController *vc = nil;
+		switch (indexPath.row) {
+			case 0: vc = [RV64DisksViewController new]; break;
+			case 1: vc = [RV64FirmwareViewController new]; break;
+			case 2: vc = [RV64SharesViewController new]; break;
+			case 3: vc = [RV64GPUViewController new]; break;
+			case 4: vc = [RV64JITViewController new]; break;
+			case 5: vc = [RV64BackgroundViewController new]; break;
+			case 6: vc = [RV64FilesLogsViewController new]; break;
+		}
+		if (vc) {
+			[self.navigationController pushViewController:vc animated:YES];
+		}
 		return;
 	}
 	if (indexPath.section == 2 && indexPath.row == 0) {

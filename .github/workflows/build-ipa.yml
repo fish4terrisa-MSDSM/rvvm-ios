@@ -1,0 +1,64 @@
+name: Build rvvm-ios .ipa
+
+# Builds the .ipa when a PR is merged (push to main), on manual dispatch,
+# and as a build check on pull requests.
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    name: Build .ipa (Theos)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install host tools
+        run: brew install ldid xz
+
+      - name: Setup Theos
+        uses: beerpiss/theos-action@v1
+        with:
+          theos-dir: ${{ github.workspace }}/theos
+          cache: true
+
+      - name: Build and package
+        run: |
+          set -e
+          make clean
+          make package FINALPACKAGE=1
+          make ipa
+
+      - name: Locate artifacts
+        id: artifacts
+        run: |
+          echo "ipa=$(ls packages/*.ipa | head -n1)" >> "$GITHUB_OUTPUT"
+          ls -lh packages/ || true
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvvm-ios-ipa
+          path: packages/*.ipa
+          if-no-files-found: error
+
+      - name: Upload .deb artifact
+        if: ${{ hashFiles('packages/*.deb') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvvm-ios-deb
+          path: packages/*.deb
+
+      - name: Attach .ipa to release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" packages/*.ipa --clobber

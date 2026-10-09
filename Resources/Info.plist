@@ -42,5 +42,145 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+
+	<!-- Files.app integration (like iSH): expose Documents/ and allow
+	     "Open in place" so images/firmware/logs are manageable from Files -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UISupportsDocumentBrowser</key>
+	<false/>
+
+	<!-- Background keep-alive strategies (user-selectable in Settings) -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.adih.rvvm.keepalive</string>
+	</array>
+
+	<!-- Location usage (only when the location keep-alive is selected) -->
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Used as an optional keep-alive heartbeat so the VM keeps running in the background.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Used as an optional keep-alive heartbeat so the VM keeps running in the background.</string>
+
+	<!-- Import/export of disks, ISOs and firmware via Files / "Open in" -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Disk Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adih.rvvm.diskimage</string>
+				<string>public.data</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>ISO Image</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adih.rvvm.iso</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Firmware</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.adih.rvvm.firmware</string>
+			</array>
+		</dict>
+	</array>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.adih.rvvm.diskimage</string>
+			<key>UTTypeDescription</key>
+			<string>Disk Image</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>img</string>
+					<string>raw</string>
+					<string>qcow2</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.adih.rvvm.iso</string>
+			<key>UTTypeDescription</key>
+			<string>ISO Image</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>iso</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.adih.rvvm.firmware</string>
+			<key>UTTypeDescription</key>
+			<string>OpenSBI Firmware</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>bin</string>
+					<string>fw</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+
+	<!-- URL scheme used by JIT enablers (StikDebug & friends) to call back -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.adih.rvvm</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>rvvm</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

@@ -1,0 +1,3284 @@
+From e1ea29aba7b0600cc5a4432b56676e17119fbe7a Mon Sep 17 00:00:00 2001
+From: rvvm-ios <rvvm-ios@local>
+Date: Fri, 9 Oct 2026 05:41:27 +0000
+Subject: [PATCH 4/9] devices: Add virtio-gpu device (2D + optional rutabaga
+ backend) with protocol test
+
+virtio-gpu v1.0 2D device over virtio-mmio: control + cursor queues,
+RESOURCE_CREATE_2D/ATTACH_BACKING/TRANSFER_TO_HOST_2D/SET_SCANOUT/FLUSH,
+GET_DISPLAY_INFO/GET_EDID, cursor UPDATE/MOVE, fence echo, snapshot suspend.
+Renders into an rvvm_fbdev scanout in device-managed VRAM (format-converted
+from any 32bpp virtio format).
+
+Optional USE_RUTABAGA=1 build dlopen()s a rutabaga library (virgl/gfxstream)
+at runtime to serve 3D contexts, capsets and command submission, advertising
+VIRTIO_GPU_F_VIRGL to the guest.
+
+tests/virtio-gpu: bare-metal RISC-V payload exercising the full protocol
+under a headless librvvm harness; verifies exact VRAM pixel contents and
+cursor state. All 12 protocol tests + host-side verification pass.
+---
+ .gitignore                        |    9 +
+ project.mk                        |    5 +-
+ src/devices/virtio-gpu.c          | 2298 +++++++++++++++++++++++++++++
+ src/devices/virtio-gpu.h          |   45 +
+ tests/virtio-gpu/README.md        |   40 +
+ tests/virtio-gpu/link.ld          |   36 +
+ tests/virtio-gpu/vgtest_host.c    |  197 +++
+ tests/virtio-gpu/vgtest_payload.c |  555 +++++++
+ 8 files changed, 3184 insertions(+), 1 deletion(-)
+ create mode 100644 src/devices/virtio-gpu.c
+ create mode 100644 src/devices/virtio-gpu.h
+ create mode 100644 tests/virtio-gpu/README.md
+ create mode 100644 tests/virtio-gpu/link.ld
+ create mode 100644 tests/virtio-gpu/vgtest_host.c
+ create mode 100644 tests/virtio-gpu/vgtest_payload.c
+
+diff --git a/.gitignore b/.gitignore
+index 4fd33b3..c76429e 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,6 +22,15 @@
+ !/include
+ !/src
+ 
++# Explicitly track tests
++!/tests
++/tests/*
++!/tests/virtio-gpu/
++/tests/virtio-gpu/*
++!/tests/virtio-gpu/*.c
++!/tests/virtio-gpu/*.ld
++!/tests/virtio-gpu/*.md
++
+ # Explicitly track build system
+ !/Makefile
+ !/project.mk
+diff --git a/project.mk b/project.mk
+index 23d101b..6cb5fcc 100644
+--- a/project.mk
++++ b/project.mk
+@@ -81,9 +81,12 @@ USE_SOUND   ?= 0          # Enable sound support
+ USE_GDBSTUB ?= $(USE_NET) # Support debugging the guest via GDB remote protocol
+ 
+ # Board features
+-USE_FDT  ?= 1 # Enable Flattened Device Tree automatic generation
++USE_FDT ?= 1 # Enable Flattened Device Tree automatic generation
+ USE_VFIO ?= 1 # Support PCIe VFIO pass-through on Linux hosts
+ 
++# Devices
++USE_RUTABAGA ?= 0 # virtio-gpu: runtime-loadable rutabaga backend (virgl/gfxstream GPU acceleration)
++
+ # Infrastructure
+ USE_INFRA_TESTS ?= 0 # Build infrastructure tests
+ USE_LIBS_PROBE  ?= 0 # Probe libraries in runtime instead of linking to them
+diff --git a/src/devices/virtio-gpu.c b/src/devices/virtio-gpu.c
+new file mode 100644
+index 0000000..790c562
+--- /dev/null
++++ b/src/devices/virtio-gpu.c
+@@ -0,0 +1,2298 @@
++/*
++virtio-gpu.c - virtio-gpu device (2D acceleration + optional rutabaga/virgl/gfxstream backend)
++Ported/created for rvvm-ios: cross-platform virtio GPU over virtio-mmio transport.
++
++This implements the virtio-gpu 2D feature set (scanout, resources, transfers,
++flushes, cursors, EDID) presenting through rvvm_fbdev, plus an optional bridge
++to a rutabaga library for virgl/gfxstream host-side GPU acceleration.
++*/
++
++#include "virtio-gpu.h"
++
++#include "fdtlib.h"
++#include "mem_ops.h"
++#include "spinlock.h"
++#include "utils.h"
++#include "vector.h"
++#include "vma_ops.h"
++
++#include <rvvm/rvvm_fb.h>
++#include <rvvm/rvvm_snapshot.h>
++
++#include <string.h>
++
++#ifdef USE_RUTABAGA
++// Optional rutabaga backend (GPU acceleration via virgl/gfxstream), dlopen()ed at runtime
++#include <dlfcn.h>
++#include <sys/uio.h>
++#define RUTABAGA_BRIDGE 1
++#endif
++
++/*
++ * Virtio-MMIO register offsets (same layout as virtio-fs/virtio-input devices)
++ */
++enum {
++    VIRTIO_MMIO_MAGIC               = 0x000,
++    VIRTIO_MMIO_VERSION             = 0x004,
++    VIRTIO_MMIO_DEVICE_ID           = 0x008,
++    VIRTIO_MMIO_VENDOR_ID           = 0x00c,
++    VIRTIO_MMIO_DEVICE_FEATURES     = 0x010,
++    VIRTIO_MMIO_DEVICE_FEATURES_SEL = 0x014,
++    VIRTIO_MMIO_DRIVER_FEATURES     = 0x020,
++    VIRTIO_MMIO_DRIVER_FEATURES_SEL = 0x024,
++    VIRTIO_MMIO_QUEUE_SEL           = 0x030,
++    VIRTIO_MMIO_QUEUE_NUM_MAX       = 0x034,
++    VIRTIO_MMIO_QUEUE_NUM           = 0x038,
++    VIRTIO_MMIO_QUEUE_READY         = 0x044,
++    VIRTIO_MMIO_QUEUE_NOTIFY        = 0x050,
++    VIRTIO_MMIO_INTERRUPT_STATUS    = 0x060,
++    VIRTIO_MMIO_INTERRUPT_ACK       = 0x064,
++    VIRTIO_MMIO_STATUS              = 0x070,
++    VIRTIO_MMIO_QUEUE_DESC_LOW      = 0x080,
++    VIRTIO_MMIO_QUEUE_DESC_HIGH     = 0x084,
++    VIRTIO_MMIO_QUEUE_AVAIL_LOW     = 0x090,
++    VIRTIO_MMIO_QUEUE_AVAIL_HIGH    = 0x094,
++    VIRTIO_MMIO_QUEUE_USED_LOW      = 0x0a0,
++    VIRTIO_MMIO_QUEUE_USED_HIGH     = 0x0a4,
++    VIRTIO_MMIO_CONFIG_GENERATION   = 0x0fc,
++    VIRTIO_MMIO_CONFIG              = 0x100,
++};
++
++enum {
++    VIRTQ_DESC_F_NEXT     = 1,
++    VIRTQ_DESC_F_WRITE    = 2,
++    VIRTQ_DESC_F_INDIRECT = 4,
++};
++
++enum {
++    VIRTIO_STATUS_ACK     = 1,
++    VIRTIO_STATUS_DRIVER  = 2,
++    VIRTIO_STATUS_DRIVER_OK = 4,
++    VIRTIO_STATUS_FEATURES_OK = 8,
++    VIRTIO_STATUS_FAILED  = 128,
++    VIRTIO_STATUS_DEVICE_NEEDS_RESET = 64,
++};
++
++#define VIRTIO_ID_GPU          0x10
++#define VIRTIO_MMIO_VENDOR_VALUE 0x5256564d // "RVVM"
++
++/*
++ * Feature bits
++ */
++#define VIRTIO_F_VERSION_1          32
++#define VIRTIO_RING_F_INDIRECT_DESC 28
++#define VIRTIO_RING_F_EVENT_IDX     29
++#define VIRTIO_GPU_F_VIRGL          0
++#define VIRTIO_GPU_F_EDID           1
++#define VIRTIO_GPU_F_RESOURCE_UUID  2
++#define VIRTIO_GPU_F_RESOURCE_BLOB  3
++#define VIRTIO_GPU_F_CONTEXT_INIT   4
++
++/*
++ * virtio-gpu commands
++ */
++enum {
++    VIRTIO_GPU_CMD_GET_DISPLAY_INFO   = 0x0100,
++    VIRTIO_GPU_CMD_RESOURCE_CREATE_2D = 0x0101,
++    VIRTIO_GPU_CMD_RESOURCE_UNREF     = 0x0102,
++    VIRTIO_GPU_CMD_SET_SCANOUT        = 0x0103,
++    VIRTIO_GPU_CMD_RESOURCE_FLUSH     = 0x0104,
++    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D = 0x0105,
++    VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106,
++    VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107,
++    VIRTIO_GPU_CMD_GET_CAPSET_INFO    = 0x0108,
++    VIRTIO_GPU_CMD_GET_CAPSET         = 0x0109,
++    VIRTIO_GPU_CMD_GET_EDID           = 0x0120,
++    VIRTIO_GPU_CMD_CTX_CREATE         = 0x0110,
++    VIRTIO_GPU_CMD_CTX_DESTROY        = 0x0111,
++    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE = 0x0112,
++    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE = 0x0113,
++    VIRTIO_GPU_CMD_RESOURCE_CREATE_3D = 0x0114,
++    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D = 0x0115,
++    VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0116,
++    VIRTIO_GPU_CMD_SUBMIT_3D          = 0x0117,
++    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB  = 0x0118,
++    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB = 0x0119,
++    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB   = 0x011a,
++    VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID = 0x011b,
++    VIRTIO_GPU_CMD_UPDATE_CURSOR      = 0x0300,
++    VIRTIO_GPU_CMD_MOVE_CURSOR        = 0x0301,
++};
++
++enum {
++    VIRTIO_GPU_RESP_OK_NODATA          = 0x8000,
++    VIRTIO_GPU_RESP_OK_DISPLAY_INFO    = 0x8100,
++    VIRTIO_GPU_RESP_OK_CAPSET_INFO     = 0x8102,
++    VIRTIO_GPU_RESP_OK_CAPSET          = 0x8103,
++    VIRTIO_GPU_RESP_OK_EDID            = 0x8104,
++    VIRTIO_GPU_RESP_OK_RESOURCE_UUID   = 0x8105,
++    VIRTIO_GPU_RESP_OK_MAP_INFO        = 0x8106,
++    VIRTIO_GPU_RESP_ERR_UNSPEC         = 0x8200,
++    VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY  = 0x8201,
++    VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID = 0x8202,
++    VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID = 0x8203,
++    VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID  = 0x8204,
++    VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER   = 0x8205,
++};
++
++#define VIRTIO_GPU_FLAG_FENCE  0x01
++
++#define VIRTIO_GPU_MAX_SCANOUTS  16
++#define VIRTIO_GPU_MAX_RESOURCE_SIZE (64u << 20)
++#define VIRTIO_GPU_MAX_IOVECS     512
++#define VIRTIO_GPU_MAX_CAPSET_SIZE (256u * 1024u)
++
++/*
++ * virtio-gpu pixel formats (subset we can scan out or store)
++ */
++enum {
++    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM = 1,
++    VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM = 2,
++    VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM = 3,
++    VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM = 4,
++};
++
++typedef struct __attribute__((packed)) {
++    uint64_t addr;
++    uint32_t len;
++    uint16_t flags;
++    uint16_t next;
++} virtq_desc_t;
++
++typedef struct __attribute__((packed)) {
++    uint16_t flags;
++    uint16_t idx;
++} virtq_avail_t;
++
++typedef struct __attribute__((packed)) {
++    uint32_t len;
++    uint32_t flags;
++} virtq_used_elem_t;
++
++typedef struct {
++    uint16_t num;
++    uint8_t  ready;
++    uint16_t last_avail_idx;
++    uint16_t used_idx;
++    uint64_t desc_addr;
++    uint64_t avail_addr;
++    uint64_t used_addr;
++} virtio_queue_t;
++
++typedef struct __attribute__((packed)) {
++    uint32_t type;
++    uint32_t flags;
++    uint64_t fence_id;
++    uint32_t ctx_id;
++    uint32_t padding;
++} virtio_gpu_hdr_t;
++
++typedef struct __attribute__((packed)) {
++    uint32_t x;
++    uint32_t y;
++    uint32_t width;
++    uint32_t height;
++} virtio_gpu_rect_t;
++
++typedef struct __attribute__((packed)) {
++    virtio_gpu_rect_t r;
++    uint32_t enabled;
++    uint32_t flags;
++} virtio_gpu_mode_t;
++
++typedef struct __attribute__((packed)) {
++    uint64_t addr;
++    uint32_t length;
++    uint32_t space;
++} virtio_gpu_mem_entry_t;
++
++typedef struct {
++    uint32_t id;
++    bool     used;
++    bool     is_3d;
++    bool     is_cursor;
++    uint32_t width;
++    uint32_t height;
++    uint32_t bpp;
++    rvvm_rgb_t format;
++    uint8_t* backing;
++    size_t   backing_size;
++    // Guest backing memory (attached iovecs)
++    struct {
++        uint64_t addr;
++        uint32_t len;
++    } iovec[VIRTIO_GPU_MAX_IOVECS];
++    uint32_t iovec_count;
++} virtio_gpu_resource_t;
++
++typedef struct {
++    bool      enabled;
++    uint32_t  x;
++    uint32_t  y;
++    uint32_t  width;
++    uint32_t  height;
++    uint32_t  resource_id;
++} virtio_gpu_scanout_t;
++
++#ifdef RUTABAGA_BRIDGE
++// Resolved from librutabaga at runtime (see rutabaga_gfx_ffi.h)
++struct rutabaga;
++
++struct rutabaga_rv_bridge {
++    void* dl;
++    struct rutabaga* rata;
++    int32_t (*init)(const void* builder, struct rutabaga** ptr);
++    int32_t (*finish)(struct rutabaga** ptr);
++    int32_t (*get_num_capsets)(struct rutabaga* ptr, uint32_t* num);
++    int32_t (*get_capset_info)(struct rutabaga* ptr, uint32_t idx, uint32_t* id, uint32_t* ver, uint32_t* size);
++    int32_t (*get_capset)(struct rutabaga* ptr, uint32_t id, uint32_t version, uint8_t* capset, uint32_t size);
++    int32_t (*context_create)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t context_init, const char* name,
++                              uint32_t name_len);
++    int32_t (*context_destroy)(struct rutabaga* ptr, uint32_t ctx_id);
++    int32_t (*context_attach_resource)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id);
++    int32_t (*context_detach_resource)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id);
++    int32_t (*resource_create_3d)(struct rutabaga* ptr, uint32_t res_id, const void* create_3d);
++    int32_t (*resource_attach_backing)(struct rutabaga* ptr, uint32_t res_id, const void* iovecs);
++    int32_t (*resource_detach_backing)(struct rutabaga* ptr, uint32_t res_id);
++    int32_t (*resource_transfer_read)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id, const void* transfer,
++                                      const void* iovec);
++    int32_t (*resource_transfer_write)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id, const void* transfer);
++    int32_t (*resource_create_blob)(struct rutabaga* ptr, uint32_t ctx_id, uint32_t res_id, const void* create_blob,
++                                    const void* iovecs, const void* handle);
++    int32_t (*resource_unref)(struct rutabaga* ptr, uint32_t res_id);
++    int32_t (*resource_map)(struct rutabaga* ptr, uint32_t res_id, void* mapping);
++    int32_t (*resource_unmap)(struct rutabaga* ptr, uint32_t res_id);
++    int32_t (*resource_map_info)(struct rutabaga* ptr, uint32_t res_id, uint32_t* map_info);
++    int32_t (*submit_command)(struct rutabaga* ptr, void* cmd);
++    int32_t (*create_fence)(struct rutabaga* ptr, const void* fence);
++};
++
++struct rutabaga_builder_rv {
++    uint64_t user_data;
++    uint64_t capset_mask;
++    uint64_t wsi;
++    void*    fence_cb;
++    void*    debug_cb;
++    void*    channels;
++    const char* renderer_features;
++};
++#endif
++
++typedef struct {
++    rvvm_machine_t* machine;
++    rvvm_intc_t*    intc;
++    rvvm_irq_t      irq;
++
++    rvvm_fbdev_t*   fbdev;
++    bool            owns_fbdev_ref;
++    void*           vram;
++    size_t          vram_size;
++    bool            owns_vram;
++    uint32_t        disp_width;
++    uint32_t        disp_height;
++
++    spinlock_t lock;
++
++    // Command processing buffers (allocated at init)
++    uint8_t* req_buf;
++    uint8_t* resp_buf;
++    size_t   buf_cap;
++
++    uint32_t host_features[2];
++    uint32_t driver_features[2];
++    uint32_t host_features_sel;
++    uint32_t driver_features_sel;
++
++    uint32_t status;
++    uint32_t interrupt_status;
++    uint32_t queue_sel;
++    uint32_t config_generation;
++
++    virtio_queue_t q[2];
++
++    virtio_gpu_resource_t resources[64];
++    virtio_gpu_scanout_t   scanout[VIRTIO_GPU_MAX_SCANOUTS];
++    virtio_gpu_cursor_info_t cursor;
++    uint64_t fence_seq;
++
++    // Pending fence passthrough (rutabaga)
++    uint64_t pending_fence_id;
++
++#ifdef RUTABAGA_BRIDGE
++    struct rutabaga_rv_bridge* rtb;
++#endif
++} virtio_gpu_dev_t;
++
++/*
++ * Virtqueue helpers
++ */
++
++static void* virtio_gpu_dma_ptr(virtio_gpu_dev_t* vg, uint64_t addr, size_t len)
++{
++    return rvvm_get_dma_ptr(vg->machine, (rvvm_addr_t)addr, len);
++}
++
++static uint32_t mmio_load_u32(const void* data, uint8_t size)
++{
++    if (size == 1) {
++        return read_uint8(data);
++    }
++    if (size == 2) {
++        return read_uint16_le(data);
++    }
++    return read_uint32_le(data);
++}
++
++static void mmio_store_u32(void* data, uint32_t val, uint8_t size)
++{
++    if (size == 1) {
++        write_uint8(data, (uint8_t)val);
++    } else if (size == 2) {
++        write_uint16_le(data, (uint16_t)val);
++    } else {
++        write_uint32_le(data, val);
++    }
++}
++
++static bool virtq_load_desc(virtio_gpu_dev_t* vg, uint64_t table_addr, uint32_t table_entries, uint16_t idx,
++                            virtq_desc_t* out)
++{
++    if (!out || table_addr == 0 || table_entries == 0 || idx >= table_entries) {
++        return false;
++    }
++    uint8_t* p = virtio_gpu_dma_ptr(vg, table_addr + (uint64_t)idx * sizeof(virtq_desc_t), sizeof(virtq_desc_t));
++    if (!p) {
++        return false;
++    }
++    out->addr  = read_uint64_le(p + 0);
++    out->len   = read_uint32_le(p + 8);
++    out->flags = read_uint16_le(p + 12);
++    out->next  = read_uint16_le(p + 14);
++    return true;
++}
++
++typedef struct {
++    uint16_t head;
++    uint32_t total_len;
++    uint32_t in_count;  // device-readable (guest -> device)
++    uint32_t out_count; // device-writable (device -> guest)
++    struct {
++        uint64_t addr;
++        uint32_t len;
++        uint8_t  write;
++    } seg[128];
++} virtq_chain_t;
++
++static bool virtq_collect_descs(virtio_gpu_dev_t* vg, uint64_t table_addr, uint32_t table_entries, uint16_t head,
++                                virtq_chain_t* chain)
++{
++    virtq_desc_t d;
++    uint16_t idx = head;
++    for (uint32_t hops = 0; hops < table_entries + 8; ++hops) {
++        if (!virtq_load_desc(vg, table_addr, table_entries, idx, &d)) {
++            return false;
++        }
++        if (chain->in_count + chain->out_count >= STATIC_ARRAY_SIZE(chain->seg)) {
++            return false;
++        }
++        uint32_t si = chain->in_count + chain->out_count;
++        chain->seg[si].addr  = d.addr;
++        chain->seg[si].len   = d.len;
++        chain->seg[si].write = (d.flags & VIRTQ_DESC_F_WRITE) ? 1 : 0;
++        chain->total_len += d.len;
++        if (chain->seg[si].write) {
++            chain->out_count++;
++        } else {
++            chain->in_count++;
++        }
++
++        if (d.flags & VIRTQ_DESC_F_INDIRECT) {
++            uint32_t entries = d.len / (uint32_t)sizeof(virtq_desc_t);
++            if (entries == 0 || entries > 4096) {
++                return false;
++            }
++            if (!virtq_collect_descs(vg, d.addr, entries, 0, chain)) {
++                return false;
++            }
++            return true;
++        }
++
++        if (!(d.flags & VIRTQ_DESC_F_NEXT)) {
++            return true;
++        }
++        idx = d.next;
++    }
++    return false;
++}
++
++static bool virtq_collect_chain(virtio_gpu_dev_t* vg, virtio_queue_t* q, uint16_t head, virtq_chain_t* chain)
++{
++    if (!q || !chain || q->num == 0) {
++        return false;
++    }
++    memset(chain, 0, sizeof(*chain));
++    chain->head = head;
++    return virtq_collect_descs(vg, q->desc_addr, q->num, head, chain);
++}
++
++
++/*
++ * Chain I/O: treat readable segs as a linear request buffer,
++ * writable segs as a linear response buffer.
++ */
++static size_t virtq_chain_read(virtio_gpu_dev_t* vg, const virtq_chain_t* chain, size_t off, void* buf, size_t len)
++{
++    uint8_t* out = buf;
++    size_t done = 0;
++    size_t pos = 0;
++    for (uint32_t i = 0; i < chain->in_count + chain->out_count && done < len; ++i) {
++        if (chain->seg[i].write) {
++            continue;
++        }
++        if (pos + chain->seg[i].len <= off) {
++            pos += chain->seg[i].len;
++            continue;
++        }
++        size_t seg_off = (pos > off) ? 0 : (off - pos);
++        size_t take = chain->seg[i].len - seg_off;
++        if (take > len - done) {
++            take = len - done;
++        }
++        const uint8_t* src = virtio_gpu_dma_ptr(vg, chain->seg[i].addr + seg_off, take);
++        if (!src) {
++            break;
++        }
++        memcpy(out + done, src, take);
++        done += take;
++        pos += chain->seg[i].len;
++    }
++    return done;
++}
++
++static size_t virtq_chain_write(virtio_gpu_dev_t* vg, const virtq_chain_t* chain, size_t off, const void* buf,
++                                size_t len)
++{
++    const uint8_t* in = buf;
++    size_t done = 0;
++    size_t pos = 0;
++    for (uint32_t i = 0; i < chain->in_count + chain->out_count && done < len; ++i) {
++        if (!chain->seg[i].write) {
++            continue;
++        }
++        if (pos + chain->seg[i].len <= off) {
++            pos += chain->seg[i].len;
++            continue;
++        }
++        size_t seg_off = (pos > off) ? 0 : (off - pos);
++        size_t take = chain->seg[i].len - seg_off;
++        if (take > len - done) {
++            take = len - done;
++        }
++        uint8_t* dst = virtio_gpu_dma_ptr(vg, chain->seg[i].addr + seg_off, take);
++        if (!dst) {
++            break;
++        }
++        memcpy(dst, in + done, take);
++        done += take;
++        pos += chain->seg[i].len;
++    }
++    return done;
++}
++
++static void virtq_push_used(virtio_gpu_dev_t* vg, virtio_queue_t* q, uint16_t head, uint32_t len)
++{
++    if (!vg || !q || q->used_addr == 0 || q->num == 0) {
++        return;
++    }
++    uint8_t* used_p = virtio_gpu_dma_ptr(vg, q->used_addr, 4 + (size_t)q->num * sizeof(virtq_used_elem_t));
++    if (!used_p) {
++        return;
++    }
++    uint16_t used_idx = q->used_idx;
++    uint32_t slot = (uint32_t)(used_idx % q->num);
++    size_t elem_off = 4 + (size_t)slot * sizeof(virtq_used_elem_t);
++    write_uint32_le(used_p + elem_off + 0, head);
++    write_uint32_le(used_p + elem_off + 4, len);
++    used_idx++;
++    q->used_idx = used_idx;
++    write_uint16_le(used_p + 2, used_idx);
++
++    vg->interrupt_status |= 1;
++    rvvm_raise_irq(vg->intc, vg->irq);
++}
++
++/*
++ * Resources
++ */
++
++static virtio_gpu_resource_t* vg_resource_find(virtio_gpu_dev_t* vg, uint32_t id)
++{
++    if (id == 0) {
++        return NULL;
++    }
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->resources); ++i) {
++        if (vg->resources[i].used && vg->resources[i].id == id) {
++            return &vg->resources[i];
++        }
++    }
++    return NULL;
++}
++
++static virtio_gpu_resource_t* vg_resource_alloc(virtio_gpu_dev_t* vg, uint32_t id)
++{
++    if (id == 0 || vg_resource_find(vg, id)) {
++        return NULL;
++    }
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->resources); ++i) {
++        if (!vg->resources[i].used) {
++            memset(&vg->resources[i], 0, sizeof(vg->resources[i]));
++            vg->resources[i].id = id;
++            vg->resources[i].used = true;
++            return &vg->resources[i];
++        }
++    }
++    return NULL;
++}
++
++static void vg_resource_unref(virtio_gpu_dev_t* vg, virtio_gpu_resource_t* res)
++{
++    if (!res) {
++        return;
++    }
++#ifdef RUTABAGA_BRIDGE
++    if (vg->rtb && res->is_3d) {
++        vg->rtb->resource_detach_backing(vg->rtb->rata, res->id);
++        vg->rtb->resource_unref(vg->rtb->rata, res->id);
++    }
++#else
++    UNUSED(vg);
++#endif
++    if (res->backing) {
++        free(res->backing);
++    }
++    res->backing = NULL;
++    res->backing_size = 0;
++    res->used = false;
++}
++
++static uint32_t vg_virtio_format_to_rvvm(uint32_t fmt, bool* ok)
++{
++    *ok = true;
++    switch (fmt) {
++        case VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM: return RVVM_RGB_XRGB8888 | RVVM_RGB_ALPHA_MASK;
++        case VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM: return RVVM_RGB_XRGB8888;
++        case VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM: return RVVM_RGB_XBGR8888 | RVVM_RGB_ALPHA_MASK;
++        case VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM: return RVVM_RGB_XBGR8888;
++        default: *ok = false; return RVVM_RGB_INVALID;
++    }
++}
++
++/*
++ * Guest backing memory access (attached iovecs form a linear buffer)
++ */
++static bool vg_guest_read(virtio_gpu_dev_t* vg, virtio_gpu_resource_t* res, uint64_t off, void* buf, size_t len)
++{
++    uint8_t* out = buf;
++    size_t done = 0;
++    uint64_t pos = 0;
++    for (uint32_t i = 0; i < res->iovec_count && done < len; ++i) {
++        if (pos + res->iovec[i].len <= off) {
++            pos += res->iovec[i].len;
++            continue;
++        }
++        size_t seg_off = (size_t)((pos > off) ? 0 : (off - pos));
++        size_t take = res->iovec[i].len - seg_off;
++        if (take > len - done) {
++            take = len - done;
++        }
++        const uint8_t* src = virtio_gpu_dma_ptr(vg, res->iovec[i].addr + seg_off, take);
++        if (!src) {
++            return false;
++        }
++        memcpy(out + done, src, take);
++        done += take;
++        pos += res->iovec[i].len;
++    }
++    return done == len;
++}
++
++static size_t vg_guest_size(const virtio_gpu_resource_t* res)
++{
++    size_t size = 0;
++    for (uint32_t i = 0; i < res->iovec_count; ++i) {
++        size += res->iovec[i].len;
++    }
++    return size;
++}
++
++/*
++ * Scanout: blit resource into VRAM (format-converted), mark dirty.
++ * The fbdev scanout is a view into VRAM sized to the guest scanout rect.
++ */
++static void vg_scanout_blit(virtio_gpu_dev_t* vg, const virtio_gpu_rect_t* rect)
++{
++    virtio_gpu_scanout_t* scan = &vg->scanout[0];
++    if (!scan->enabled || scan->resource_id == 0) {
++        return;
++    }
++    virtio_gpu_resource_t* res = vg_resource_find(vg, scan->resource_id);
++    if (!res || res->bpp != 32 || res->width == 0 || res->height == 0 || !res->backing) {
++        return;
++    }
++
++    uint8_t* vram = vg->vram;
++    uint32_t dst_w = scan->width;
++    uint32_t dst_h = scan->height;
++    if (!vram || dst_w == 0 || dst_h == 0) {
++        return;
++    }
++    if ((size_t)dst_w * dst_h * 4 > vg->vram_size) {
++        return;
++    }
++
++    // Clip the dirty rect to both the resource and the scanout
++    uint32_t x0 = rect->x;
++    uint32_t y0 = rect->y;
++    uint32_t x1 = rect->x + rect->width;
++    uint32_t y1 = rect->y + rect->height;
++    if (x0 < scan->x) x0 = scan->x;
++    if (y0 < scan->y) y0 = scan->y;
++    if (x1 > scan->x + scan->width) x1 = scan->x + scan->width;
++    if (y1 > scan->y + scan->height) y1 = scan->y + scan->height;
++    if (x0 >= x1 || y0 >= y1) {
++        return;
++    }
++
++    // Source rect in resource coords
++    uint32_t sx = x0 - scan->x;
++    uint32_t sy = y0 - scan->y;
++
++    // Strides: resource and VRAM scanout (both 32bpp)
++    size_t src_stride = (size_t)res->width * 4;
++    size_t dst_stride = (size_t)dst_w * 4;
++
++    const uint8_t* src = res->backing;
++    uint8_t* dst = vram;
++
++    // VRAM pixel format is XRGB8888 (a8r8g8b8, memory {B,G,R,X})
++    bool same_fmt = (res->format & 0x0F) == 4 && !(res->format & (RVVM_RGB_SWAP_R_B | RVVM_RGB_BIG_ENDIAN));
++    bool swap_rb = (res->format & RVVM_RGB_SWAP_R_B) != 0;
++
++    for (uint32_t y = y0; y < y1; ++y) {
++        const uint8_t* s = src + (size_t)(sy + (y - y0)) * src_stride + (size_t)sx * 4;
++        uint8_t* d = dst + (size_t)y * dst_stride + (size_t)x0 * 4;
++        if (same_fmt) {
++            memcpy(d, s, (size_t)(x1 - x0) * 4);
++        } else {
++            for (uint32_t x = 0; x < (x1 - x0); ++x) {
++                if (swap_rb) {
++                    // Source {R,G,B,X} -> dest {B,G,R,X}
++                    d[x * 4 + 0] = s[x * 4 + 2];
++                    d[x * 4 + 1] = s[x * 4 + 1];
++                    d[x * 4 + 2] = s[x * 4 + 0];
++                } else {
++                    d[x * 4 + 0] = s[x * 4 + 0];
++                    d[x * 4 + 1] = s[x * 4 + 1];
++                    d[x * 4 + 2] = s[x * 4 + 2];
++                }
++                d[x * 4 + 3] = 0xFF;
++            }
++        }
++    }
++
++    rvvm_fbdev_dirty(vg->fbdev);
++    rvvm_fbdev_update(vg->fbdev);
++}
++
++/*
++ * Apply the current scanout mode to the fbdev
++ */
++static void vg_scanout_apply(virtio_gpu_dev_t* vg)
++{
++    virtio_gpu_scanout_t* scan = &vg->scanout[0];
++    if (!vg->fbdev || !vg->vram) {
++        return;
++    }
++    if (scan->enabled && scan->width > 0 && scan->height > 0
++        && (size_t)scan->width * scan->height * 4 <= vg->vram_size) {
++        rvvm_fb_t fb = {
++            .buffer = vg->vram,
++            .width = scan->width,
++            .height = scan->height,
++            .stride = 0,
++            .format = RVVM_RGB_XRGB8888,
++        };
++        rvvm_fbdev_set_scanout(vg->fbdev, &fb);
++    } else {
++        // Disabled scanout: show a blank mode of the default size
++        rvvm_fb_t fb = {
++            .buffer = vg->vram,
++            .width = vg->disp_width,
++            .height = vg->disp_height,
++            .stride = 0,
++            .format = RVVM_RGB_XRGB8888,
++        };
++        if ((size_t)fb.width * fb.height * 4 <= vg->vram_size) {
++            rvvm_fbdev_set_scanout(vg->fbdev, &fb);
++        }
++    }
++    rvvm_fbdev_dirty(vg->fbdev);
++    rvvm_fbdev_update(vg->fbdev);
++}
++
++/*
++ * EDID generation: 128-byte block describing our single fixed mode
++ */
++static void vg_build_edid(virtio_gpu_dev_t* vg, uint8_t* edid)
++{
++    memset(edid, 0, 128);
++    uint32_t h = vg->disp_width;
++    uint32_t v = vg->disp_height;
++
++    // Header
++    edid[0] = 0x00; edid[1] = 0xFF; edid[2] = 0xFF; edid[3] = 0xFF;
++    edid[4] = 0xFF; edid[5] = 0xFF; edid[6] = 0xFF; edid[7] = 0x00;
++
++    // Manufacturer ID "RVV" (3 letters compressed into 2 bytes)
++    edid[8]  = 0x46; // R=10001, V=10101 -> 0100 0110
++    edid[9]  = 0xB5; // V=10101 -> 1011 0101
++    edid[10] = 0x00; // product code lo
++    edid[11] = 0x00; // product code hi
++    edid[12] = 0x00; // serial
++    edid[13] = 0x00;
++    edid[14] = 0x00;
++    edid[15] = 0x00;
++    edid[16] = 0x01; // week
++    edid[17] = 0x20; // year (2020+)
++    edid[18] = 0x01; // EDID version
++    edid[19] = 0x04; // revision
++
++    edid[20] = 0xA7; // Video input: digital, 8bpc, DP
++    edid[21] = 0x00; // screen size h
++    edid[22] = 0x00; // screen size v
++    edid[23] = 0x78; // gamma = 120/100 + 1 = 2.2
++    edid[24] = 0xEA; // features: RGB 4:4:4, sRGB, preferred timing
++
++    // Chromaticity (sRGB defaults)
++    static const uint8_t chroma[10] = {
++        0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
++    };
++    memcpy(edid + 25, chroma, sizeof(chroma));
++
++    edid[35] = 0x00; // established timings
++    edid[36] = 0x00;
++    edid[37] = 0x00;
++    edid[38] = 0x00; // standard timings (unused)
++    edid[39] = 0x00;
++    edid[40] = 0x00;
++    edid[41] = 0x00;
++    edid[42] = 0x00;
++    edid[43] = 0x00;
++    edid[44] = 0x00;
++    edid[45] = 0x00;
++    edid[46] = 0x00;
++    edid[47] = 0x00;
++    edid[48] = 0x00;
++    edid[49] = 0x00;
++    edid[50] = 0x00;
++    edid[51] = 0x00;
++    edid[52] = 0x00;
++    edid[53] = 0x00;
++    edid[54] = 0x00;
++
++    // Descriptor 1: detailed timing for our mode (18 bytes at offset 54)
++    // 60Hz, non-interlaced, digital separate sync
++    uint32_t hactive = h;
++    uint32_t vactive = v;
++    uint32_t pixclk_khz = (uint32_t)(((uint64_t)hactive * vactive * 60) / 1000);
++    if (pixclk_khz < 1000) pixclk_khz = 1000;
++    if (pixclk_khz > 0xFFFF * 10) pixclk_khz = 0xFFFF * 10;
++
++    uint32_t hblank = (hactive / 5) & ~1U;
++    uint32_t vblank = (vactive / 20 + 20) & ~1U;
++    uint32_t hsync_w = (hactive / 12) & ~1U;
++    uint32_t vsync_w = 1;
++    uint32_t hfront = (hblank / 3) & ~1U;
++    uint32_t vfront = (vblank / 3) & ~1U;
++
++    uint8_t* dtd = edid + 54;
++    dtd[0] = (pixclk_khz / 10) & 0xFF;
++    dtd[1] = ((pixclk_khz / 10) >> 8) & 0xFF;
++    dtd[2] = hactive & 0xFF;
++    dtd[3] = hblank & 0xFF;
++    dtd[4] = (uint8_t)(((hactive >> 8) & 0x0F) << 4 | ((hblank >> 8) & 0x0F));
++    dtd[5] = vactive & 0xFF;
++    dtd[6] = vblank & 0xFF;
++    dtd[7] = (uint8_t)(((vactive >> 8) & 0x0F) << 4 | ((vblank >> 8) & 0x0F));
++    dtd[8] = hfront & 0xFF;
++    dtd[9] = hsync_w & 0xFF;
++    dtd[10] = (uint8_t)((((hfront >> 8) & 0x0F) << 6) | (((hsync_w >> 8) & 0x0F) << 4) | ((vfront & 0x0F) << 2) | (vsync_w & 0x0F));
++    dtd[11] = 0x00;
++    dtd[12] = 0x1E; // image size h (cm)
++    dtd[13] = 0x00;
++    dtd[14] = 0x0F; // image size v (cm)
++    dtd[15] = 0x00;
++    dtd[16] = 0x00; // h border
++    dtd[17] = 0x00; // v border
++    dtd[18] = 0x1E; // digital, separate sync
++
++    // Descriptor 2: monitor name
++    edid[72 + 3] = 0xFC;
++    const char* name = "RVVM Display";
++    for (size_t i = 0; i < 13 && name[i]; ++i) {
++        edid[72 + 5 + i] = (uint8_t)name[i];
++    }
++    edid[72 + 18] = 0x0A;
++
++    // Descriptor 3: range limits (60Hz fixed mode)
++    edid[90 + 3] = 0xFD;
++    edid[90 + 5] = 50;   // min vrefresh
++    edid[90 + 6] = 60;   // max vrefresh
++    edid[90 + 7] = 30;   // min hsync kHz
++    edid[90 + 8] = 140;  // max hsync kHz
++    edid[90 + 9] = 255;  // max pixel clock /10MHz (2.55GHz)
++    edid[90 + 10] = 0x00; // no extended timing
++    edid[90 + 11] = 0x0A; // LF terminator
++    // Descriptor 4: dummy
++    edid[108 + 0] = 0x00; edid[108 + 1] = 0x00; edid[108 + 2] = 0x00; edid[108 + 3] = 0x10;
++
++    edid[126] = 0x00; // extension count
++    uint8_t sum = 0;
++    for (size_t i = 0; i < 127; ++i) {
++        sum += edid[i];
++    }
++    edid[127] = (uint8_t)(0x100 - sum);
++}
++
++#ifdef RUTABAGA_BRIDGE
++/*
++ * Rutabaga (virgl/gfxstream) backend bridge
++ */
++static void rtb_fence_cb(uint64_t user_data, const void* fence)
++{
++    // Fence completion callback. Requests are completed synchronously
++    // after submit, so this only records the latest signalled fence.
++    virtio_gpu_dev_t* vg = (virtio_gpu_dev_t*)(uintptr_t)user_data;
++    if (vg && fence) {
++        // struct rutabaga_fence {u32 flags; u64 fence_id; u32 ctx_id; u32 ring_idx}
++        uint64_t fence_id = 0;
++        memcpy(&fence_id, (const uint8_t*)fence + 8, sizeof(fence_id));
++        vg->pending_fence_id = fence_id;
++    }
++}
++
++static bool vg_rutabaga_load(virtio_gpu_dev_t* vg, const char* libpath)
++{
++    static const char* paths[] = {
++        "librutabaga_gfx_ffi.so",
++        "librutabaga.so.0",
++        "librutabaga.so",
++        "/usr/local/lib/librutabaga_gfx_ffi.so",
++        "/usr/lib/librutabaga_gfx_ffi.so",
++    };
++    void* dl = NULL;
++    if (libpath) {
++        dl = dlopen(libpath, RTLD_NOW | RTLD_LOCAL);
++    }
++    for (size_t i = 0; !dl && i < STATIC_ARRAY_SIZE(paths); ++i) {
++        dl = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
++    }
++    if (!dl) {
++        rvvm_warn("virtio-gpu: rutabaga library not found (%s)", libpath ? libpath : "auto");
++        return false;
++    }
++
++    struct rutabaga_rv_bridge* rtb = calloc(1, sizeof(*rtb));
++    if (!rtb) {
++        dlclose(dl);
++        return false;
++    }
++
++#define RTB_SYM(name)                                              \
++    do {                                                           \
++        rtb->name = dlsym(dl, #name);                              \
++        if (!rtb->name) {                                          \
++            rvvm_warn("virtio-gpu: rutabaga missing symbol %s", #name); \
++            free(rtb);                                             \
++            dlclose(dl);                                           \
++            return false;                                          \
++        }                                                          \
++    } while (0)
++
++    RTB_SYM(init);
++    RTB_SYM(finish);
++    RTB_SYM(get_num_capsets);
++    RTB_SYM(get_capset_info);
++    RTB_SYM(get_capset);
++    RTB_SYM(context_create);
++    RTB_SYM(context_destroy);
++    RTB_SYM(context_attach_resource);
++    RTB_SYM(context_detach_resource);
++    RTB_SYM(resource_create_3d);
++    RTB_SYM(resource_attach_backing);
++    RTB_SYM(resource_detach_backing);
++    RTB_SYM(resource_transfer_read);
++    RTB_SYM(resource_transfer_write);
++    RTB_SYM(resource_create_blob);
++    RTB_SYM(resource_unref);
++    RTB_SYM(resource_map);
++    RTB_SYM(resource_unmap);
++    RTB_SYM(resource_map_info);
++    RTB_SYM(submit_command);
++    RTB_SYM(create_fence);
++#undef RTB_SYM
++
++    struct rutabaga_builder_rv builder = {
++        .user_data = (uint64_t)(uintptr_t)vg,
++        .capset_mask = 0, // all supported capsets
++        .wsi = 0,         // RUTABAGA_WSI_SURFACELESS
++        .fence_cb = rtb_fence_cb,
++        .debug_cb = NULL,
++        .channels = NULL,
++        .renderer_features = NULL,
++    };
++
++    if (rtb->init(&builder, &rtb->rata) != 0 || !rtb->rata) {
++        rvvm_warn("virtio-gpu: rutabaga_init failed");
++        free(rtb);
++        dlclose(dl);
++        return false;
++    }
++
++    rtb->dl = dl;
++    vg->rtb = rtb;
++    // Advertise virgl acceleration to the guest
++    vg->host_features[0] |= 1U << VIRTIO_GPU_F_VIRGL;
++    return true;
++}
++#endif
++
++/*
++ * Command responses
++ */
++
++typedef struct {
++    uint8_t* data;
++    size_t len;
++    size_t cap;
++} vg_resp_buf_t;
++
++static void vg_resp_init(vg_resp_buf_t* b, uint8_t* data, size_t cap)
++{
++    b->data = data;
++    b->cap = cap;
++    b->len = 0;
++}
++
++static void vg_resp_put(vg_resp_buf_t* b, const void* data, size_t len)
++{
++    if (b->len + len > b->cap) {
++        return;
++    }
++    memcpy(b->data + b->len, data, len);
++    b->len += len;
++}
++
++static void vg_resp_hdr(vg_resp_buf_t* b, uint32_t type, const virtio_gpu_hdr_t* req)
++{
++    virtio_gpu_hdr_t hdr = {
++        .type = type,
++        .flags = 0,
++        .fence_id = req ? req->fence_id : 0,
++        .ctx_id = 0,
++        .padding = 0,
++    };
++    vg_resp_put(b, &hdr, sizeof(hdr));
++}
++
++/*
++ * Control queue command processing. Returns response length.
++ */
++static size_t vg_handle_ctrl(virtio_gpu_dev_t* vg, const uint8_t* req, size_t req_len, vg_resp_buf_t* resp)
++{
++    if (req_len < sizeof(virtio_gpu_hdr_t)) {
++        return 0;
++    }
++
++    virtio_gpu_hdr_t hdr;
++    memcpy(&hdr, req, sizeof(hdr));
++
++    switch (hdr.type) {
++        case VIRTIO_GPU_CMD_GET_DISPLAY_INFO: {
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_DISPLAY_INFO, &hdr);
++            for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; ++i) {
++                virtio_gpu_mode_t mode = {0};
++                if (i == 0) {
++                    mode.r.x = 0;
++                    mode.r.y = 0;
++                    mode.r.width = vg->disp_width;
++                    mode.r.height = vg->disp_height;
++                    mode.enabled = 1;
++                    mode.flags = 0;
++                }
++                vg_resp_put(resp, &mode, sizeof(mode));
++            }
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: {
++            struct {
++                uint32_t resource_id;
++                uint32_t format;
++                uint32_t width;
++                uint32_t height;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++
++            bool fmt_ok = false;
++            rvvm_rgb_t fmt = vg_virtio_format_to_rvvm(in.format, &fmt_ok);
++            if (!fmt_ok || in.width == 0 || in.height == 0 || in.width > 8192 || in.height > 8192
++                || (uint64_t)in.width * in.height * 4 > VIRTIO_GPU_MAX_RESOURCE_SIZE) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                return resp->len;
++            }
++
++            virtio_gpu_resource_t* res = vg_resource_alloc(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            res->width = in.width;
++            res->height = in.height;
++            res->format = fmt;
++            res->bpp = 32;
++            res->backing_size = (size_t)in.width * in.height * 4;
++            res->backing = calloc(1, res->backing_size);
++            if (!res->backing) {
++                res->used = false;
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, &hdr);
++                return resp->len;
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_RESOURCE_UNREF: {
++            struct {
++                uint32_t resource_id;
++                uint32_t padding;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; ++i) {
++                if (vg->scanout[i].resource_id == in.resource_id) {
++                    vg->scanout[i].resource_id = 0;
++                    vg->scanout[i].enabled = false;
++                }
++            }
++            vg_resource_unref(vg, res);
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_SET_SCANOUT: {
++            struct {
++                virtio_gpu_rect_t r;
++                uint32_t scanout_id;
++                uint32_t resource_id;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++
++            if (in.scanout_id >= VIRTIO_GPU_MAX_SCANOUTS || (in.scanout_id != 0)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID, &hdr);
++                return resp->len;
++            }
++
++            virtio_gpu_scanout_t* scan = &vg->scanout[0];
++            if (in.resource_id == 0) {
++                // Disable scanout
++                scan->enabled = false;
++                scan->resource_id = 0;
++                vg_scanout_apply(vg);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            if (in.r.x + (uint64_t)in.r.width > res->width || in.r.y + (uint64_t)in.r.height > res->height
++                || in.r.x + (uint64_t)in.r.width > vg->disp_width || in.r.y + (uint64_t)in.r.height > vg->disp_height) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                return resp->len;
++            }
++
++            bool mode_changed = (scan->width != in.r.width) || (scan->height != in.r.height) || !scan->enabled;
++            scan->x = in.r.x;
++            scan->y = in.r.y;
++            scan->width = in.r.width;
++            scan->height = in.r.height;
++            scan->resource_id = in.resource_id;
++            scan->enabled = true;
++            if (mode_changed) {
++                vg_scanout_apply(vg);
++            }
++            // Blit the whole scanout right away
++            {
++                virtio_gpu_rect_t whole = {
++                    .x = in.r.x,
++                    .y = in.r.y,
++                    .width = in.r.width,
++                    .height = in.r.height,
++                };
++                vg_scanout_blit(vg, &whole);
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_RESOURCE_FLUSH: {
++            struct {
++                virtio_gpu_rect_t r;
++                uint32_t resource_id;
++                uint32_t padding;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++#ifdef RUTABAGA_BRIDGE
++            if (vg->rtb && res->is_3d) {
++                // Pull the rendered contents from the backend, then blit
++                // struct rutabaga_transfer {x,y,z,w,h,d,level,stride,layer_stride; u64 offset}
++                uint8_t tr_buf[48] = {0};
++                uint32_t tr[9] = { 0, 0, 0, res->width, res->height, 1, 0, 0, 0 };
++                memcpy(tr_buf, tr, 36);
++                // struct iovec {base, len}
++                struct { void* base; size_t len; } iov = { res->backing, res->backing_size };
++                vg->rtb->resource_transfer_read(vg->rtb->rata, hdr.ctx_id, res->id, tr_buf, &iov);
++            }
++#endif
++            if (vg->scanout[0].enabled && vg->scanout[0].resource_id == in.resource_id) {
++                vg_scanout_blit(vg, &in.r);
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: {
++            struct {
++                virtio_gpu_rect_t r;
++                uint64_t offset;
++                uint32_t resource_id;
++                uint32_t padding;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            if (res->bpp != 32 || !res->backing) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                return resp->len;
++            }
++            if ((uint64_t)in.r.x + in.r.width > res->width || (uint64_t)in.r.y + in.r.height > res->height) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                return resp->len;
++            }
++
++#ifdef RUTABAGA_BRIDGE
++            if (vg->rtb && res->is_3d) {
++                uint8_t tr_buf[48] = {0};
++                uint32_t tr[9] = { in.r.x, in.r.y, 0, in.r.width, in.r.height, 1, 0, 0, 0 };
++                memcpy(tr_buf, tr, 36);
++                memcpy(tr_buf + 40, &in.offset, 8);
++                vg->rtb->resource_transfer_write(vg->rtb->rata, hdr.ctx_id, res->id, tr_buf);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++#endif
++
++            // Copy rect rows from the guest backing buffer into the host copy
++            size_t row_bytes = (size_t)in.r.width * 4;
++            for (uint32_t y = 0; y < in.r.height; ++y) {
++                uint64_t src_off = in.offset + ((uint64_t)y * res->width + in.r.x) * 4;
++                uint8_t* dst = res->backing + ((size_t)(in.r.y + y) * res->width + in.r.x) * 4;
++                if (src_off + row_bytes > vg_guest_size(res)) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                if (!vg_guest_read(vg, res, src_off, dst, row_bytes)) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: {
++            // struct virtio_gpu_resource_attach_backing { hdr; resource_id; nr_entries }
++            struct {
++                uint32_t resource_id;
++                uint32_t nr_entries;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            if (in.nr_entries > VIRTIO_GPU_MAX_IOVECS) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            size_t entries_off = sizeof(hdr) + 8;
++            if (req_len < entries_off + (size_t)in.nr_entries * 16) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            res->iovec_count = 0;
++            for (uint32_t i = 0; i < in.nr_entries; ++i) {
++                virtio_gpu_mem_entry_t ent;
++                memcpy(&ent, req + entries_off + (size_t)i * 16, sizeof(ent));
++                res->iovec[i].addr = ent.addr;
++                res->iovec[i].len = ent.length;
++                res->iovec_count++;
++            }
++#ifdef RUTABAGA_BRIDGE
++            if (vg->rtb && res->is_3d && res->iovec_count) {
++                // Hand the guest backing memory to the backend
++                struct { void* base; size_t len; } vecs[VIRTIO_GPU_MAX_IOVECS];
++                struct { void* vecs; size_t count; } iovecs;
++                for (uint32_t i = 0; i < res->iovec_count; ++i) {
++                    vecs[i].base = virtio_gpu_dma_ptr(vg, res->iovec[i].addr, res->iovec[i].len);
++                    vecs[i].len = res->iovec[i].len;
++                }
++                iovecs.vecs = vecs;
++                iovecs.count = res->iovec_count;
++                vg->rtb->resource_attach_backing(vg->rtb->rata, res->id, &iovecs);
++            }
++#endif
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: {
++            struct {
++                uint32_t resource_id;
++                uint32_t padding;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (!res) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                return resp->len;
++            }
++            res->iovec_count = 0;
++#ifdef RUTABAGA_BRIDGE
++            if (vg->rtb && res->is_3d) {
++                vg->rtb->resource_detach_backing(vg->rtb->rata, res->id);
++            }
++#endif
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_GET_EDID: {
++            struct {
++                uint32_t scanout;
++                uint32_t padding;
++            } in;
++            if (req_len < sizeof(hdr) + sizeof(in)) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), sizeof(in));
++            if (in.scanout != 0) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID, &hdr);
++                return resp->len;
++            }
++            // struct virtio_gpu_resp_edid { hdr; size; padding; edid[1024] }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_EDID, &hdr);
++            uint32_t size = 128;
++            uint32_t pad = 0;
++            vg_resp_put(resp, &size, 4);
++            vg_resp_put(resp, &pad, 4);
++            uint8_t edid[128];
++            vg_build_edid(vg, edid);
++            vg_resp_put(resp, edid, 128);
++            return resp->len;
++        }
++        default:
++            break;
++    }
++
++#ifdef RUTABAGA_BRIDGE
++    if (vg->rtb) {
++        // 3D commands forwarded to the backend
++        switch (hdr.type) {
++            case VIRTIO_GPU_CMD_GET_CAPSET_INFO: {
++                struct {
++                    uint32_t capset_index;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                uint32_t capset_id = 0, capset_ver = 0, capset_size = 0;
++                if (vg->rtb->get_capset_info(vg->rtb->rata, in.capset_index, &capset_id, &capset_ver,
++                                             &capset_size) != 0) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                // struct virtio_gpu_resp_capset_info {capset_id, capset_max_version, capset_max_size, padding}
++                struct {
++                    uint32_t capset_id;
++                    uint32_t capset_max_version;
++                    uint32_t capset_max_size;
++                    uint32_t padding;
++                } out = { capset_id, capset_ver, capset_size, 0 };
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_CAPSET_INFO, &hdr);
++                vg_resp_put(resp, &out, sizeof(out));
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_GET_CAPSET: {
++                struct {
++                    uint32_t capset_id;
++                    uint32_t capset_version;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                uint32_t num = 0, id = 0, ver = 0, size = 0;
++                bool found = false;
++                if (vg->rtb->get_num_capsets(vg->rtb->rata, &num) == 0) {
++                    for (uint32_t i = 0; i < num; ++i) {
++                        if (vg->rtb->get_capset_info(vg->rtb->rata, i, &id, &ver, &size) == 0
++                            && id == in.capset_id && ver == in.capset_version) {
++                            found = true;
++                            break;
++                        }
++                    }
++                }
++                if (!found || size == 0 || size > VIRTIO_GPU_MAX_CAPSET_SIZE) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                uint8_t* capset = calloc(1, size);
++                if (!capset) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, &hdr);
++                    return resp->len;
++                }
++                if (vg->rtb->get_capset(vg->rtb->rata, in.capset_id, in.capset_version, capset, size) != 0) {
++                    free(capset);
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_CAPSET, &hdr);
++                vg_resp_put(resp, capset, size);
++                free(capset);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_CTX_CREATE: {
++                // struct virtio_gpu_ctx_create { hdr; nlen; context_init; debug_name[64] }
++                // ctx_id is carried in hdr.ctx_id
++                struct {
++                    uint32_t nlen;
++                    uint32_t context_init;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                const char* name = (const char*)req + sizeof(hdr) + 8;
++                uint32_t name_len = in.nlen;
++                if (name_len > 64) {
++                    name_len = 64;
++                }
++                vg->rtb->context_create(vg->rtb->rata, hdr.ctx_id, in.context_init, name, name_len);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_CTX_DESTROY: {
++                // struct virtio_gpu_ctx_destroy { hdr } - ctx_id in hdr.ctx_id
++                vg->rtb->context_destroy(vg->rtb->rata, hdr.ctx_id);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE: {
++                // struct virtio_gpu_ctx_resource { hdr; resource_id; padding }
++                struct {
++                    uint32_t resource_id;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                vg->rtb->context_attach_resource(vg->rtb->rata, hdr.ctx_id, in.resource_id);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE: {
++                struct {
++                    uint32_t resource_id;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                vg->rtb->context_detach_resource(vg->rtb->rata, hdr.ctx_id, in.resource_id);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: {
++                // hdr + {resource_id, target, format, bind, w, h, depth, array_size,
++                //        last_level, nr_samples, flags, padding}
++                struct {
++                    uint32_t resource_id;
++                    uint32_t target;
++                    uint32_t format;
++                    uint32_t bind;
++                    uint32_t width;
++                    uint32_t height;
++                    uint32_t depth;
++                    uint32_t array_size;
++                    uint32_t last_level;
++                    uint32_t nr_samples;
++                    uint32_t flags;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                virtio_gpu_resource_t* res = vg_resource_alloc(vg, in.resource_id);
++                if (!res) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                res->is_3d = true;
++                res->width = in.width;
++                res->height = in.height;
++                res->bpp = 32;
++                res->format = RVVM_RGB_XRGB8888;
++                res->backing_size = (size_t)in.width * in.height * 4;
++                res->backing = calloc(1, res->backing_size ? res->backing_size : 1);
++                if (!res->backing) {
++                    res->used = false;
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, &hdr);
++                    return resp->len;
++                }
++                // struct rutabaga_create_3d {target,format,bind,w,h,depth,array_size,last_level,nr_samples,flags}
++                uint32_t c3d[10] = {
++                    in.target, in.format, in.bind, in.width, in.height,
++                    in.depth, in.array_size, in.last_level, in.nr_samples, in.flags,
++                };
++                if (vg->rtb->resource_create_3d(vg->rtb->rata, in.resource_id, c3d) != 0) {
++                    vg_resource_unref(vg, res);
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_SUBMIT_3D: {
++                // struct virtio_gpu_cmd_submit { hdr; size; padding; cmds }
++                // ctx_id is carried in hdr.ctx_id
++                struct {
++                    uint32_t size;
++                    uint32_t padding;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                if (in.size == 0 || in.size > (1 << 20) || sizeof(hdr) + 8 + (uint64_t)in.size > req_len) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, &hdr);
++                    return resp->len;
++                }
++                // struct rutabaga_command {ctx_id, cmd_size, cmd*, _reserved_1, _reserved_2}
++                struct {
++                    uint32_t ctx_id;
++                    uint32_t cmd_size;
++                    uint8_t* cmd;
++                    uint32_t pad1;
++                    void* pad2;
++                } cmd = {
++                    .ctx_id = hdr.ctx_id,
++                    .cmd_size = in.size,
++                    .cmd = (uint8_t*)req + sizeof(hdr) + 8,
++                    .pad1 = 0,
++                    .pad2 = NULL,
++                };
++                if (vg->rtb->submit_command(vg->rtb->rata, &cmd) != 0) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                    return resp->len;
++                }
++                // Complete the fence (if any) synchronously
++                if (hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
++                    // struct rutabaga_fence {u32 flags; u64 fence_id; u32 ctx_id; u32 ring_idx}
++                    uint32_t fence[6] = {0};
++                    fence[2] = (uint32_t)(hdr.fence_id & 0xFFFFFFFFU);
++                    fence[3] = (uint32_t)(hdr.fence_id >> 32);
++                    fence[4] = hdr.ctx_id;
++                    fence[5] = 0;
++                    vg->rtb->create_fence(vg->rtb->rata, fence);
++                }
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: {
++                // hdr + box{x,y,z,w,h,d} + offset + resource_id + level + stride + layer_stride
++                struct {
++                    uint32_t x, y, z, w, h, d;
++                    uint64_t offset;
++                    uint32_t resource_id;
++                    uint32_t level;
++                    uint32_t stride;
++                    uint32_t layer_stride;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                // struct rutabaga_transfer {x,y,z,w,h,d,level,stride,layer_stride,offset}
++                uint32_t tr[10] = {
++                    in.x, in.y, in.z, in.w, in.h, in.d, in.level, in.stride, in.layer_stride, 0,
++                };
++                uint64_t tr_off = in.offset;
++                // Offset follows the 9 u32s in rutabaga_transfer
++                uint8_t tr_buf[40 + 8];
++                memcpy(tr_buf, tr, 36);
++                memset(tr_buf + 36, 0, 4);
++                memcpy(tr_buf + 40, &tr_off, 8);
++                vg->rtb->resource_transfer_write(vg->rtb->rata, hdr.ctx_id, in.resource_id, tr_buf);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: {
++                struct {
++                    uint32_t x, y, z, w, h, d;
++                    uint64_t offset;
++                    uint32_t resource_id;
++                    uint32_t level;
++                    uint32_t stride;
++                    uint32_t layer_stride;
++                } in;
++                if (req_len < sizeof(hdr) + sizeof(in)) {
++                    break;
++                }
++                memcpy(&in, req + sizeof(hdr), sizeof(in));
++                virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++                if (!res) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                uint8_t tr_buf[40 + 8];
++                uint32_t tr[10] = {
++                    in.x, in.y, in.z, in.w, in.h, in.d, in.level, in.stride, in.layer_stride, 0,
++                };
++                memcpy(tr_buf, tr, 36);
++                memset(tr_buf + 36, 0, 4);
++                memcpy(tr_buf + 40, &in.offset, 8);
++                // struct iovec {base, len}
++                struct {
++                    void* base;
++                    size_t len;
++                } iov = { res->backing, res->backing_size };
++                vg->rtb->resource_transfer_read(vg->rtb->rata, hdr.ctx_id, in.resource_id, tr_buf, &iov);
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++                return resp->len;
++            }
++            default:
++                break;
++        }
++    }
++#endif
++
++    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++    return resp->len;
++}
++
++/*
++ * Cursor queue processing. Returns response length.
++ */
++static size_t vg_handle_cursor(virtio_gpu_dev_t* vg, const uint8_t* req, size_t req_len, vg_resp_buf_t* resp)
++{
++    if (req_len < sizeof(virtio_gpu_hdr_t)) {
++        return 0;
++    }
++    virtio_gpu_hdr_t hdr;
++    memcpy(&hdr, req, sizeof(hdr));
++
++    switch (hdr.type) {
++        case VIRTIO_GPU_CMD_UPDATE_CURSOR: {
++            // struct virtio_gpu_update_cursor {
++            //   hdr; pos{scanout_id,x,y,padding}; resource_id; hot_x; hot_y; padding }
++            struct {
++                uint32_t scanout_id;
++                uint32_t x;
++                uint32_t y;
++                uint32_t padding;
++                uint32_t resource_id;
++                uint32_t hot_x;
++                uint32_t hot_y;
++                uint32_t padding2;
++            } in;
++            if (req_len < sizeof(hdr) + 32) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), 32);
++            if (in.scanout_id != 0 && in.scanout_id != 0xFFFFFFFFU) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID, &hdr);
++                return resp->len;
++            }
++            virtio_gpu_resource_t* res = vg_resource_find(vg, in.resource_id);
++            if (in.resource_id != 0) {
++                if (!res) {
++                    vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, &hdr);
++                    return resp->len;
++                }
++                res->is_cursor = true;
++                vg->cursor.visible = true;
++                vg->cursor.resource_id = in.resource_id;
++                vg->cursor.pos_x = (int32_t)in.x;
++                vg->cursor.pos_y = (int32_t)in.y;
++                vg->cursor.hot_x = in.hot_x;
++                vg->cursor.hot_y = in.hot_y;
++            } else {
++                vg->cursor.visible = false;
++                vg->cursor.resource_id = 0;
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        case VIRTIO_GPU_CMD_MOVE_CURSOR: {
++            struct {
++                uint32_t scanout_id;
++                uint32_t x;
++                uint32_t y;
++                uint32_t padding;
++                uint32_t resource_id;
++            } in;
++            if (req_len < sizeof(hdr) + 20) {
++                vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++                return resp->len;
++            }
++            memcpy(&in, req + sizeof(hdr), 20);
++            vg->cursor.pos_x = (int32_t)in.x;
++            vg->cursor.pos_y = (int32_t)in.y;
++            if (in.resource_id) {
++                vg->cursor.resource_id = in.resource_id;
++                vg->cursor.visible = true;
++            }
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_OK_NODATA, &hdr);
++            return resp->len;
++        }
++        default:
++            vg_resp_hdr(resp, VIRTIO_GPU_RESP_ERR_UNSPEC, &hdr);
++            return resp->len;
++    }
++}
++
++/*
++ * Queue processing
++ */
++static void virtio_gpu_process_queue(virtio_gpu_dev_t* vg, virtio_queue_t* q, bool cursor)
++{
++    if (!vg || !q || !q->ready || q->num == 0) {
++        return;
++    }
++    if (!vg->req_buf || !vg->resp_buf || vg->buf_cap == 0) {
++        return;
++    }
++
++    uint8_t* avail_p = virtio_gpu_dma_ptr(vg, q->avail_addr, 4 + (size_t)q->num * 2);
++    if (!avail_p) {
++        return;
++    }
++
++    // Buffers: requests up to 16K (hdr + 512 iovec entries),
++    // responses up to 16K (EDID 1056 bytes, display info 388 bytes, capsets capped)
++    spin_lock(&vg->lock);
++
++    uint16_t avail_idx = read_uint16_le(avail_p + 2);
++    while (q->last_avail_idx != avail_idx) {
++        uint16_t ring_slot = (uint16_t)(q->last_avail_idx % q->num);
++        uint16_t head = read_uint16_le(avail_p + 4 + (size_t)ring_slot * 2);
++        q->last_avail_idx++;
++
++        virtq_chain_t chain;
++        if (!virtq_collect_chain(vg, q, head, &chain)) {
++            virtq_push_used(vg, q, head, 0);
++            continue;
++        }
++
++        size_t req_len = virtq_chain_read(vg, &chain, 0, vg->req_buf, vg->buf_cap);
++        if (req_len < sizeof(virtio_gpu_hdr_t)) {
++            virtq_push_used(vg, q, head, 0);
++            continue;
++        }
++
++        vg_resp_buf_t resp;
++        vg_resp_init(&resp, vg->resp_buf, vg->buf_cap);
++        size_t resp_len = cursor ? vg_handle_cursor(vg, vg->req_buf, req_len, &resp)
++                                 : vg_handle_ctrl(vg, vg->req_buf, req_len, &resp);
++        if (resp_len == 0) {
++            virtq_push_used(vg, q, head, 0);
++            continue;
++        }
++
++        size_t w = virtq_chain_write(vg, &chain, 0, vg->resp_buf, resp_len);
++        if (w == 0) {
++            virtq_push_used(vg, q, head, 0);
++            continue;
++        }
++        virtq_push_used(vg, q, head, (uint32_t)w);
++
++        avail_idx = read_uint16_le(avail_p + 2);
++    }
++
++    spin_unlock(&vg->lock);
++}
++
++static void virtio_gpu_reset(virtio_gpu_dev_t* vg)
++{
++    if (!vg) {
++        return;
++    }
++    vg->status = 0;
++    vg->interrupt_status = 0;
++    vg->queue_sel = 0;
++    vg->host_features_sel = 0;
++    vg->driver_features_sel = 0;
++    vg->driver_features[0] = 0;
++    vg->driver_features[1] = 0;
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->q); ++i) {
++        vg->q[i].num = 0;
++        vg->q[i].ready = 0;
++        vg->q[i].last_avail_idx = 0;
++        vg->q[i].used_idx = 0;
++        vg->q[i].desc_addr = 0;
++        vg->q[i].avail_addr = 0;
++        vg->q[i].used_addr = 0;
++    }
++    // Free guest resources
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->resources); ++i) {
++        if (vg->resources[i].used) {
++            vg_resource_unref(vg, &vg->resources[i]);
++        }
++    }
++    memset(vg->scanout, 0, sizeof(vg->scanout));
++    memset(&vg->cursor, 0, sizeof(vg->cursor));
++    vg->config_generation++;
++    rvvm_lower_irq(vg->intc, vg->irq);
++}
++
++/*
++ * MMIO handlers
++ */
++static bool virtio_gpu_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
++{
++    virtio_gpu_dev_t* vg = dev->data;
++    uint32_t val = 0;
++
++    if (offset >= VIRTIO_MMIO_CONFIG) {
++        // struct virtio_gpu_config {events_read, events_clear, num_scanouts, num_capsets, blob_alignment}
++        switch (offset - VIRTIO_MMIO_CONFIG) {
++            case 0: val = 0; break; // events_read
++            case 4: val = 0; break; // events_clear
++            case 8: val = 1; break; // num_scanouts
++#ifdef RUTABAGA_BRIDGE
++            case 12: {
++                uint32_t num = 0;
++                if (vg->rtb) {
++                    vg->rtb->get_num_capsets(vg->rtb->rata, &num);
++                }
++                val = num;
++                break;
++            }
++#else
++            case 12: val = 0; break; // num_capsets
++#endif
++            case 16: val = 4096; break; // blob_alignment
++            default: val = 0; break;
++        }
++        mmio_store_u32(data, val, size);
++        return true;
++    }
++
++    switch (offset) {
++        case VIRTIO_MMIO_MAGIC:
++            val = 0x74726976; // "virt"
++            break;
++        case VIRTIO_MMIO_VERSION:
++            val = 2;
++            break;
++        case VIRTIO_MMIO_DEVICE_ID:
++            val = VIRTIO_ID_GPU;
++            break;
++        case VIRTIO_MMIO_VENDOR_ID:
++            val = VIRTIO_MMIO_VENDOR_VALUE;
++            break;
++        case VIRTIO_MMIO_DEVICE_FEATURES:
++            val = vg->host_features[vg->host_features_sel & 1];
++            break;
++        case VIRTIO_MMIO_QUEUE_NUM_MAX:
++            val = 64;
++            break;
++        case VIRTIO_MMIO_QUEUE_NUM:
++            val = vg->q[vg->queue_sel & 1].num;
++            break;
++        case VIRTIO_MMIO_QUEUE_READY:
++            val = vg->q[vg->queue_sel & 1].ready;
++            break;
++        case VIRTIO_MMIO_INTERRUPT_STATUS:
++            val = vg->interrupt_status;
++            break;
++        case VIRTIO_MMIO_STATUS:
++            val = vg->status;
++            break;
++        case VIRTIO_MMIO_QUEUE_DESC_LOW:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].desc_addr);
++            break;
++        case VIRTIO_MMIO_QUEUE_DESC_HIGH:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].desc_addr >> 32);
++            break;
++        case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].avail_addr);
++            break;
++        case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].avail_addr >> 32);
++            break;
++        case VIRTIO_MMIO_QUEUE_USED_LOW:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].used_addr);
++            break;
++        case VIRTIO_MMIO_QUEUE_USED_HIGH:
++            val = (uint32_t)(vg->q[vg->queue_sel & 1].used_addr >> 32);
++            break;
++        case VIRTIO_MMIO_CONFIG_GENERATION:
++            val = vg->config_generation;
++            break;
++        default:
++            mmio_store_u32(data, 0, size);
++            return true;
++    }
++
++    mmio_store_u32(data, val, size);
++    return true;
++}
++
++static bool virtio_gpu_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
++{
++    virtio_gpu_dev_t* vg = dev->data;
++    uint32_t val = mmio_load_u32(data, size);
++
++    if (offset >= VIRTIO_MMIO_CONFIG) {
++        // events_clear: no events are ever raised
++        return true;
++    }
++
++    switch (offset) {
++        case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
++            vg->host_features_sel = val & 1;
++            break;
++        case VIRTIO_MMIO_DRIVER_FEATURES:
++            vg->driver_features[vg->driver_features_sel & 1] = val;
++            break;
++        case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
++            vg->driver_features_sel = val & 1;
++            break;
++        case VIRTIO_MMIO_QUEUE_SEL:
++            vg->queue_sel = val & 1;
++            break;
++        case VIRTIO_MMIO_QUEUE_NUM:
++            if (val > 0 && val <= 64) {
++                vg->q[vg->queue_sel & 1].num = (uint16_t)val;
++                vg->q[vg->queue_sel & 1].last_avail_idx = 0;
++                vg->q[vg->queue_sel & 1].used_idx = 0;
++            }
++            break;
++        case VIRTIO_MMIO_QUEUE_READY:
++            vg->q[vg->queue_sel & 1].ready = (val != 0);
++            if (val == 0) {
++                vg->q[vg->queue_sel & 1].desc_addr = 0;
++                vg->q[vg->queue_sel & 1].avail_addr = 0;
++                vg->q[vg->queue_sel & 1].used_addr = 0;
++            }
++            break;
++        case VIRTIO_MMIO_QUEUE_NOTIFY: {
++            uint32_t idx = val & 1;
++            if (idx < STATIC_ARRAY_SIZE(vg->q)) {
++                virtio_gpu_process_queue(vg, &vg->q[idx], idx == 1);
++            }
++            break;
++        }
++        case VIRTIO_MMIO_INTERRUPT_ACK:
++            vg->interrupt_status &= ~val;
++            if (!vg->interrupt_status) {
++                rvvm_lower_irq(vg->intc, vg->irq);
++            }
++            break;
++        case VIRTIO_MMIO_STATUS:
++            vg->status = val & 0xFF;
++            if (val == 0) {
++                virtio_gpu_reset(vg);
++            }
++            break;
++        case VIRTIO_MMIO_QUEUE_DESC_LOW:
++            vg->q[vg->queue_sel & 1].desc_addr = (vg->q[vg->queue_sel & 1].desc_addr & ~0xFFFFFFFFULL) | val;
++            break;
++        case VIRTIO_MMIO_QUEUE_DESC_HIGH:
++            vg->q[vg->queue_sel & 1].desc_addr = (vg->q[vg->queue_sel & 1].desc_addr & 0xFFFFFFFFULL)
++                                                 | ((uint64_t)val << 32);
++            break;
++        case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
++            vg->q[vg->queue_sel & 1].avail_addr = (vg->q[vg->queue_sel & 1].avail_addr & ~0xFFFFFFFFULL) | val;
++            break;
++        case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
++            vg->q[vg->queue_sel & 1].avail_addr = (vg->q[vg->queue_sel & 1].avail_addr & 0xFFFFFFFFULL)
++                                                  | ((uint64_t)val << 32);
++            break;
++        case VIRTIO_MMIO_QUEUE_USED_LOW:
++            vg->q[vg->queue_sel & 1].used_addr = (vg->q[vg->queue_sel & 1].used_addr & ~0xFFFFFFFFULL) | val;
++            break;
++        case VIRTIO_MMIO_QUEUE_USED_HIGH:
++            vg->q[vg->queue_sel & 1].used_addr = (vg->q[vg->queue_sel & 1].used_addr & 0xFFFFFFFFULL)
++                                                 | ((uint64_t)val << 32);
++            break;
++        default:
++            break;
++    }
++    return true;
++}
++
++/*
++ * Snapshot support
++ */
++static void virtio_gpu_suspend(rvvm_mmio_dev_t* dev, rvvm_snapshot_t* snap, bool resume)
++{
++    virtio_gpu_dev_t* vg = dev->data;
++
++    rvvm_snapshot_section(snap, "virtio-gpu");
++
++    rvvm_snapshot_field(snap, vg->status);
++    rvvm_snapshot_field(snap, vg->interrupt_status);
++    rvvm_snapshot_field(snap, vg->queue_sel);
++    rvvm_snapshot_field(snap, vg->config_generation);
++    rvvm_snapshot_field(snap, vg->driver_features);
++    rvvm_snapshot_field(snap, vg->cursor);
++    rvvm_snapshot_field(snap, vg->fence_seq);
++
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->q); ++i) {
++        rvvm_snapshot_field(snap, vg->q[i].num);
++        rvvm_snapshot_field(snap, vg->q[i].ready);
++        rvvm_snapshot_field(snap, vg->q[i].last_avail_idx);
++        rvvm_snapshot_field(snap, vg->q[i].used_idx);
++        rvvm_snapshot_field(snap, vg->q[i].desc_addr);
++        rvvm_snapshot_field(snap, vg->q[i].avail_addr);
++        rvvm_snapshot_field(snap, vg->q[i].used_addr);
++    }
++
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->scanout); ++i) {
++        rvvm_snapshot_field(snap, vg->scanout[i]);
++    }
++
++    // Resources: only 2D contents are host-side; 3D resources live in the backend
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->resources); ++i) {
++        virtio_gpu_resource_t* res = &vg->resources[i];
++        rvvm_snapshot_field(snap, res->id);
++        rvvm_snapshot_field(snap, res->used);
++        rvvm_snapshot_field(snap, res->is_3d);
++        rvvm_snapshot_field(snap, res->is_cursor);
++        rvvm_snapshot_field(snap, res->width);
++        rvvm_snapshot_field(snap, res->height);
++        rvvm_snapshot_field(snap, res->bpp);
++        rvvm_snapshot_field(snap, res->format);
++        rvvm_snapshot_field(snap, res->iovec_count);
++        rvvm_snapshot_field(snap, res->iovec);
++        rvvm_snapshot_field(snap, res->backing_size);
++
++        if (res->used && !res->is_3d && res->backing_size > 0 && res->backing_size <= VIRTIO_GPU_MAX_RESOURCE_SIZE) {
++            if (!rvvm_snapshot_writing(snap)) {
++                if (!res->backing) {
++                    res->backing = calloc(1, res->backing_size);
++                    if (!res->backing) {
++                        rvvm_snapshot_data(snap, NULL, 1);
++                        res->backing_size = 0;
++                        continue;
++                    }
++                }
++            }
++            rvvm_snapshot_data(snap, res->backing, res->backing_size);
++        }
++    }
++
++    // VRAM scanout contents
++    size_t vram_used = 0;
++    if (vg->vram && vg->scanout[0].enabled) {
++        vram_used = (size_t)vg->scanout[0].width * vg->scanout[0].height * 4;
++        if (vram_used > vg->vram_size) {
++            vram_used = vg->vram_size;
++        }
++    }
++    rvvm_snapshot_field(snap, vram_used);
++    if (vram_used > 0) {
++        rvvm_snapshot_data(snap, vg->vram, vram_used);
++    }
++
++    if (resume) {
++        // Re-apply scanout & re-raise IRQ if pending
++        vg_scanout_apply(vg);
++        if (vg->scanout[0].enabled && vg->scanout[0].resource_id) {
++            virtio_gpu_rect_t whole = {
++                .x = vg->scanout[0].x,
++                .y = vg->scanout[0].y,
++                .width = vg->scanout[0].width,
++                .height = vg->scanout[0].height,
++            };
++            vg_scanout_blit(vg, &whole);
++        }
++        if (vg->interrupt_status) {
++            rvvm_raise_irq(vg->intc, vg->irq);
++        } else {
++            rvvm_lower_irq(vg->intc, vg->irq);
++        }
++    }
++}
++
++static void virtio_gpu_remove(rvvm_mmio_dev_t* dev)
++{
++    virtio_gpu_dev_t* vg = dev->data;
++
++    for (size_t i = 0; i < STATIC_ARRAY_SIZE(vg->resources); ++i) {
++        if (vg->resources[i].used) {
++            vg_resource_unref(vg, &vg->resources[i]);
++        }
++    }
++
++#ifdef RUTABAGA_BRIDGE
++    if (vg->rtb) {
++        vg->rtb->finish(&vg->rtb->rata);
++        dlclose(vg->rtb->dl);
++        free(vg->rtb);
++        vg->rtb = NULL;
++    }
++#endif
++
++    free(vg->req_buf);
++    free(vg->resp_buf);
++    if (vg->owns_vram && vg->vram) {
++        vma_free(vg->vram, vg->vram_size);
++    }
++    if (vg->owns_fbdev_ref) {
++        rvvm_fbdev_dec_ref(vg->fbdev);
++    }
++    free(vg);
++}
++
++static const rvvm_mmio_type_t virtio_gpu_type = {
++    .name = "virtio_gpu",
++    .remove = virtio_gpu_remove,
++    .suspend = virtio_gpu_suspend,
++};
++
++/*
++ * Public API
++ */
++PUBLIC rvvm_mmio_dev_t* virtio_gpu_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq,
++                                        rvvm_fbdev_t* fbdev, uint32_t width, uint32_t height)
++{
++    if (!machine || !intc || !fbdev) {
++        return NULL;
++    }
++    if (width == 0 || height == 0 || width > 4096 || height > 4096) {
++        width = 1280;
++        height = 800;
++    }
++
++    virtio_gpu_dev_t* vg = calloc(1, sizeof(virtio_gpu_dev_t));
++    if (!vg) {
++        return NULL;
++    }
++
++    vg->machine = machine;
++    vg->intc = intc;
++    vg->irq = irq;
++    vg->fbdev = fbdev;
++    vg->disp_width = width;
++    vg->disp_height = height;
++    vg->buf_cap = 16u << 10;
++    vg->req_buf = calloc(1, vg->buf_cap);
++    vg->resp_buf = calloc(1, vg->buf_cap);
++    if (!vg->req_buf || !vg->resp_buf) {
++        free(vg->req_buf);
++        free(vg->resp_buf);
++        free(vg);
++        return NULL;
++    }
++
++    // Feature bits: VERSION_1, INDIRECT, EVENT_IDX, EDID (+ VIRGL when rutabaga loads)
++    vg->host_features[VIRTIO_GPU_F_EDID / 32] |= 1U << (VIRTIO_GPU_F_EDID % 32);
++    vg->host_features[VIRTIO_RING_F_INDIRECT_DESC / 32] |= 1U << (VIRTIO_RING_F_INDIRECT_DESC % 32);
++    vg->host_features[VIRTIO_RING_F_EVENT_IDX / 32] |= 1U << (VIRTIO_RING_F_EVENT_IDX % 32);
++    vg->host_features[VIRTIO_F_VERSION_1 / 32] |= 1U << (VIRTIO_F_VERSION_1 % 32);
++
++    // VRAM: reuse the display-provided one, or allocate our own
++    size_t need = (size_t)width * height * 4;
++    size_t existing_size = 0;
++    void* existing = rvvm_fbdev_get_vram(fbdev, &existing_size);
++    if (existing && existing_size >= need) {
++        vg->vram = existing;
++        vg->vram_size = existing_size;
++        vg->owns_vram = false;
++    } else {
++        vg->vram_size = need;
++        vg->vram = vma_alloc(NULL, vg->vram_size, VMA_RDWR);
++        if (!vg->vram) {
++            free(vg);
++            return NULL;
++        }
++        vg->owns_vram = true;
++        rvvm_fbdev_set_vram(fbdev, vg->vram, vg->vram_size);
++    }
++
++    // Present a blank default mode
++    memset(vg->vram, 0, vg->vram_size);
++    vg_scanout_apply(vg);
++
++    rvvm_mmio_dev_t mmio_desc = {
++        .addr = addr,
++        .size = 0x1000,
++        .data = vg,
++        .type = &virtio_gpu_type,
++        .read = virtio_gpu_mmio_read,
++        .write = virtio_gpu_mmio_write,
++        .min_op_size = 1,
++        .max_op_size = 4,
++    };
++
++    rvvm_mmio_dev_t* mmio = rvvm_attach_mmio(machine, &mmio_desc);
++    if (!mmio) {
++        if (vg->owns_vram) {
++            vma_free(vg->vram, vg->vram_size);
++        }
++        free(vg);
++        return NULL;
++    }
++
++    // Keep a reference so the fbdev outlives device removal
++    rvvm_fbdev_inc_ref(fbdev);
++    vg->owns_fbdev_ref = true;
++
++#ifdef USE_FDT
++    struct fdt_node* node = fdt_node_create_reg("virtio_mmio", mmio_desc.addr);
++    fdt_node_add_prop_reg(node, "reg", mmio_desc.addr, mmio_desc.size);
++    fdt_node_add_prop_str(node, "compatible", "virtio,mmio");
++    rvvm_fdt_describe_irq(node, intc, irq);
++    fdt_node_add_child(rvvm_get_fdt_soc(machine), node);
++#endif
++
++    rvvm_info("virtio-gpu: %ux%u display at 0x%llx", width, height, (unsigned long long)addr);
++    return mmio;
++}
++
++PUBLIC rvvm_mmio_dev_t* virtio_gpu_init_auto(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev, uint32_t width,
++                                             uint32_t height)
++{
++    rvvm_intc_t* intc = rvvm_get_intc(machine);
++    rvvm_addr_t addr = rvvm_mmio_zone_auto(machine, VIRTIO_GPU_MMIO_ADDR_DEFAULT, 0x1000);
++    return virtio_gpu_init(machine, addr, intc, rvvm_alloc_irq(intc), fbdev, width, height);
++}
++
++PUBLIC bool virtio_gpu_get_cursor(rvvm_mmio_dev_t* dev, virtio_gpu_cursor_info_t* out)
++{
++    if (!dev || !dev->data || dev->type != &virtio_gpu_type || !out) {
++        return false;
++    }
++    virtio_gpu_dev_t* vg = dev->data;
++    if (!vg->cursor.visible) {
++        return false;
++    }
++    *out = vg->cursor;
++    return true;
++}
++
++PUBLIC size_t virtio_gpu_get_cursor_bitmap(rvvm_mmio_dev_t* dev, uint32_t width, uint32_t height, void* out,
++                                           size_t cap)
++{
++    if (!dev || !dev->data || dev->type != &virtio_gpu_type || !out) {
++        return 0;
++    }
++    virtio_gpu_dev_t* vg = dev->data;
++    if (!vg->cursor.visible) {
++        return 0;
++    }
++    virtio_gpu_resource_t* res = vg_resource_find(vg, vg->cursor.resource_id);
++    if (!res || res->bpp != 32 || res->width != width || res->height != height) {
++        return 0;
++    }
++    size_t need = (size_t)width * height * 4;
++    if (cap < need || !res->backing) {
++        return 0;
++    }
++    memcpy(out, res->backing, need);
++    return need;
++}
++
++PUBLIC bool virtio_gpu_init_rutabaga(rvvm_mmio_dev_t* dev, const char* libpath)
++{
++    if (!dev || !dev->data || dev->type != &virtio_gpu_type) {
++        return false;
++    }
++#ifdef RUTABAGA_BRIDGE
++    virtio_gpu_dev_t* vg = dev->data;
++    if (vg->rtb) {
++        return true;
++    }
++    if (vg->status != 0) {
++        rvvm_warn("virtio-gpu: cannot attach rutabaga after driver init");
++        return false;
++    }
++    bool ok = vg_rutabaga_load(vg, libpath);
++    if (ok) {
++        vg->config_generation++;
++    }
++    return ok;
++#else
++    UNUSED(dev);
++    UNUSED(libpath);
++    return false;
++#endif
++}
+diff --git a/src/devices/virtio-gpu.h b/src/devices/virtio-gpu.h
+new file mode 100644
+index 0000000..3366ad8
+--- /dev/null
++++ b/src/devices/virtio-gpu.h
+@@ -0,0 +1,45 @@
++#ifndef RVVM_VIRTIO_GPU_H
++#define RVVM_VIRTIO_GPU_H
++
++#include "rvvmlib.h"
++
++#define VIRTIO_GPU_MMIO_ADDR_DEFAULT 0x10004000U
++
++/*
++ * Cursor state, for display layers willing to composite the guest cursor
++ */
++typedef struct {
++    bool     visible;
++    uint32_t resource_id;
++    int32_t  pos_x;
++    int32_t  pos_y;
++    uint32_t hot_x;
++    uint32_t hot_y;
++} virtio_gpu_cursor_info_t;
++
++PUBLIC rvvm_mmio_dev_t* virtio_gpu_init(rvvm_machine_t* machine, rvvm_addr_t addr, rvvm_intc_t* intc, rvvm_irq_t irq,
++                                        rvvm_fbdev_t* fbdev, uint32_t width, uint32_t height);
++
++PUBLIC rvvm_mmio_dev_t* virtio_gpu_init_auto(rvvm_machine_t* machine, rvvm_fbdev_t* fbdev, uint32_t width,
++                                             uint32_t height);
++
++/*
++ * Query guest cursor state. Returns false if the cursor is hidden.
++ * The cursor bitmap itself lives in the cursor resource, queried below.
++ */
++PUBLIC bool virtio_gpu_get_cursor(rvvm_mmio_dev_t* dev, virtio_gpu_cursor_info_t* out);
++
++/*
++ * Copy the current guest cursor bitmap (32bpp XRGB8888) into out (cap bytes).
++ * Returns the actual size, or zero if hidden/unavailable.
++ */
++PUBLIC size_t virtio_gpu_get_cursor_bitmap(rvvm_mmio_dev_t* dev, uint32_t width, uint32_t height, void* out, size_t cap);
++
++/*
++ * Attempt to initialize a rutabaga backend (virgl/gfxstream GPU acceleration).
++ * Loads librutabaga (built with virglrenderer and/or gfxstream) at runtime.
++ * Returns false if the library is unavailable, and the device stays in 2D mode.
++ */
++PUBLIC bool virtio_gpu_init_rutabaga(rvvm_mmio_dev_t* dev, const char* libpath);
++
++#endif
+diff --git a/tests/virtio-gpu/README.md b/tests/virtio-gpu/README.md
+new file mode 100644
+index 0000000..6a43863
+--- /dev/null
++++ b/tests/virtio-gpu/README.md
+@@ -0,0 +1,40 @@
++# virtio-gpu device test
++
++A self-contained bare-metal protocol test for the virtio-gpu device, runnable
++headlessly on any host platform (no GUI, no Linux image required).
++
++## What it covers
++
++- virtio-mmio identification & feature negotiation (`VIRTIO_F_VERSION_1`, EDID,
++  indirect descriptors, event idx)
++- Control & cursor virtqueue setup, used-ring handling, IRQ signaling
++- `GET_DISPLAY_INFO` (mode 0 = the device's display size)
++- `GET_EDID` (header + checksum validation)
++- `RESOURCE_CREATE_2D` / `RESOURCE_UNREF` (including the invalid-id error path)
++- `RESOURCE_ATTACH_BACKING` + `TRANSFER_TO_HOST_2D` (with fence id echo)
++- `SET_SCANOUT` / `RESOURCE_FLUSH` -> host verifies exact pixel contents in VRAM
++- `UPDATE_CURSOR` / `MOVE_CURSOR` -> host verifies cursor state & bitmap
++
++## Building & running
++
++The guest payload is a freestanding RISC-V binary; any C compiler that can
++target `riscv64-freestanding` works (zig cc shown here):
++
++    zig cc -target riscv64-freestanding-none -mcmodel=medany -nostdlib \
++        -ffreestanding -O1 -Wl,-T,link.ld -Wl,--build-id=none \
++        -o vgtest.elf vgtest_payload.c
++
++The host harness links against the built librvvm:
++
++    gcc -o vgtest_host vgtest_host.c \
++        -I../../include -I../../src -I../../src/util -I../../src/devices \
++        -L../../release.linux.$(arch) -lrvvm -Wl,-rpath,../../release.linux.$(arch) \
++        -pthread
++
++Run (expects vgtest.elf in the current directory):
++
++    ./vgtest_host ./vgtest.elf
++
++Expected output ends with `VGTEST: ALL PASS` from the guest,
++`vgtest: scanout pixels verified`, `vgtest: cursor verified`,
++`vgtest: PASSED` from the host, exit code 0.
+diff --git a/tests/virtio-gpu/link.ld b/tests/virtio-gpu/link.ld
+new file mode 100644
+index 0000000..1f6fa8c
+--- /dev/null
++++ b/tests/virtio-gpu/link.ld
+@@ -0,0 +1,36 @@
++OUTPUT_ARCH("riscv")
++OUTPUT_FORMAT("elf64-littleriscv")
++ENTRY(_start)
++
++SECTIONS
++{
++    . = 0x80000000;
++
++    .text : {
++        KEEP(*(.text.init))
++        *(.text.startup)
++        *(.text .text.*)
++    }
++
++    .rodata : ALIGN(16) {
++        *(.rodata .rodata.*)
++        *(.srodata .srodata.*)
++    }
++
++    .data : ALIGN(16) {
++        __global_pointer$ = . + 0x800;
++        *(.data .data.*)
++        *(.sdata .sdata.*)
++    }
++
++    .bss (NOLOAD) : ALIGN(16) {
++        __bss_start = .;
++        *(.bss .bss.*)
++        *(.sbss .sbss.*)
++        *(COMMON)
++        . = ALIGN(16);
++        __bss_end = .;
++    }
++
++    /DISCARD/ : { *(.eh_frame .eh_frame_hdr .note .note.* .comment .riscv.attributes) }
++}
+diff --git a/tests/virtio-gpu/vgtest_host.c b/tests/virtio-gpu/vgtest_host.c
+new file mode 100644
+index 0000000..e2816d6
+--- /dev/null
++++ b/tests/virtio-gpu/vgtest_host.c
+@@ -0,0 +1,197 @@
++/*
++ * vgtest_host.c - host-side harness for the virtio-gpu bare-metal test
++ *
++ * Boots tests/virtio-gpu/vgtest.elf in a headless RVVM machine with the
++ * virtio-gpu device attached, captures guest serial output, and verifies
++ * the scanout contents in VRAM plus the cursor state.
++ *
++ * Build:
++ *   gcc -o vgtest_host vgtest_host.c -I../../include -I../../src -I../../src/util \
++ *       -I../../src/devices -L<libdir> -lrvvm -Wl,-rpath,<libdir> -pthread
++ */
++
++#include <rvvm/rvvm.h>
++#include <rvvm/rvvm_board.h>
++#include <rvvm/rvvm_fb.h>
++
++#include <devices/ns16550a.h>
++#include <devices/virtio-gpu.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#define VRAM_W 1280
++#define VRAM_H 800
++
++static int serial_pipe[2]; // serial_pipe[0] = read end (host), [1] = write end (guest)
++
++static void millisleep(long ms)
++{
++    struct timespec ts = {
++        .tv_sec = ms / 1000,
++        .tv_nsec = (ms % 1000) * 1000000L,
++    };
++    nanosleep(&ts, NULL);
++}
++
++int main(int argc, char** argv)
++{
++    const char* fw = (argc > 1) ? argv[1] : "vgtest.elf";
++    int failures = 0;
++
++    if (pipe(serial_pipe) != 0) {
++        perror("pipe");
++        return 2;
++    }
++    // Non-blocking read on the host end
++    fcntl(serial_pipe[0], F_SETFL, O_NONBLOCK);
++
++    rvvm_machine_t* machine = rvvm_create_machine(64U << 20, 1, "rv64");
++    if (!machine) {
++        fprintf(stderr, "vgtest: failed to create machine\n");
++        return 2;
++    }
++
++    if (!rvvm_load_firmware(machine, fw)) {
++        fprintf(stderr, "vgtest: failed to load firmware %s\n", fw);
++        return 2;
++    }
++
++    // RISC-V virt board: CLINT + PLIC + PCIe + syscon (provides machine intc)
++    if (!rvvm_board_riscv_virt_init(machine, false)) {
++        fprintf(stderr, "vgtest: failed to init board\n");
++        return 2;
++    }
++
++    // Serial console: guest output appears on serial_pipe[1]
++    chardev_t* con = chardev_fd_create(serial_pipe[0], serial_pipe[1]);
++    ns16550a_init_auto(machine, con);
++
++    // Headless framebuffer + virtio-gpu
++    rvvm_fbdev_t* fbdev = rvvm_fbdev_init();
++    rvvm_mmio_dev_t* gpu = virtio_gpu_init_auto(machine, fbdev, VRAM_W, VRAM_H);
++    if (!gpu) {
++        fprintf(stderr, "vgtest: virtio_gpu_init_auto failed\n");
++        return 2;
++    }
++
++    // Let the interpreter do its job
++    if (!rvvm_start_machine(machine)) {
++        fprintf(stderr, "vgtest: failed to start machine\n");
++        return 2;
++    }
++
++    char log[65536];
++    size_t log_len = 0;
++    log[0] = 0;
++    bool all_pass = false;
++    bool any_fail = false;
++
++    for (int iter = 0; iter < 1500; iter++) {
++        char chunk[512];
++        ssize_t r = read(serial_pipe[0], chunk, sizeof(chunk));
++        if (r > 0) {
++            size_t take = (size_t)r;
++            if (log_len + take >= sizeof(log) - 1) {
++                take = sizeof(log) - 1 - log_len;
++            }
++            memcpy(log + log_len, chunk, take);
++            log_len += take;
++            log[log_len] = 0;
++        }
++        if (strstr(log, "ALL PASS")) {
++            all_pass = true;
++            break;
++        }
++        if (strstr(log, "FAIL")) {
++            any_fail = true;
++            break;
++        }
++        millisleep(10);
++    }
++
++    // Give the device a moment to settle the final flush
++    millisleep(100);
++    rvvm_pause_machine(machine);
++
++    printf("---- guest serial log ----\n%s--------------------------\n", log);
++
++    if (!all_pass) {
++        fprintf(stderr, "vgtest: guest did not report ALL PASS\n");
++        failures++;
++    }
++
++    // Verify scanout mode
++    rvvm_fb_t fb;
++    if (!rvvm_fbdev_get_scanout(fbdev, &fb)) {
++        fprintf(stderr, "vgtest: no scanout set\n");
++        failures++;
++    } else if (rvvm_fb_width(&fb) != 64 || rvvm_fb_height(&fb) != 64) {
++        fprintf(stderr, "vgtest: scanout is %ux%u, expected 64x64\n", rvvm_fb_width(&fb), rvvm_fb_height(&fb));
++        failures++;
++    } else {
++        // Verify the gradient: pixel(x,y) = {B=0xFF-2y, G=4x, R=0x80}
++        uint8_t* vram = (uint8_t*)rvvm_fb_buffer(&fb);
++        size_t stride = rvvm_fb_stride(&fb);
++        uint32_t checked = 0;
++        uint32_t bad = 0;
++        for (uint32_t y = 0; y < 64; y += 7) {
++            for (uint32_t x = 0; x < 64; x += 5) {
++                uint8_t* px = vram + (size_t)y * stride + (size_t)x * 4;
++                uint8_t eb = (uint8_t)(0xFFU - 2 * y);
++                uint8_t eg = (uint8_t)(x * 4);
++                uint8_t er = 0x80;
++                if (px[0] != eb || px[1] != eg || px[2] != er) {
++                    if (bad < 4) {
++                        fprintf(stderr, "vgtest: pixel(%u,%u) = %02x%02x%02x, expected %02x%02x%02x\n", x, y,
++                                px[2], px[1], px[0], er, eg, eb);
++                    }
++                    bad++;
++                }
++                checked++;
++            }
++        }
++        if (bad) {
++            fprintf(stderr, "vgtest: %u/%u scanout pixels wrong\n", bad, checked);
++            failures++;
++        } else {
++            printf("vgtest: scanout pixels verified (%u sampled)\n", checked);
++        }
++    }
++
++    // Verify cursor state (after MOVE_CURSOR: pos 30,40)
++    virtio_gpu_cursor_info_t cur;
++    if (!virtio_gpu_get_cursor(gpu, &cur)) {
++        fprintf(stderr, "vgtest: cursor not visible\n");
++        failures++;
++    } else if (cur.resource_id != 3 || cur.pos_x != 30 || cur.pos_y != 40 || cur.hot_x != 2 || cur.hot_y != 2) {
++        fprintf(stderr, "vgtest: cursor state wrong: res=%u pos=%d,%d hot=%u,%u\n", cur.resource_id, cur.pos_x,
++                cur.pos_y, cur.hot_x, cur.hot_y);
++        failures++;
++    } else {
++        // Verify cursor bitmap: 8x8, guest filled with 0xFF00FF00 (A8R8G8B8: bytes 00 FF 00 FF)
++        uint32_t bmp[64];
++        size_t n = virtio_gpu_get_cursor_bitmap(gpu, 8, 8, bmp, sizeof(bmp));
++        if (n != sizeof(bmp) || bmp[0] != 0xFF00FF00U || bmp[63] != 0xFF00FF00U) {
++            fprintf(stderr, "vgtest: cursor bitmap wrong (n=%zu first=%08x)\n", n, n ? bmp[0] : 0);
++            failures++;
++        } else {
++            printf("vgtest: cursor verified\n");
++        }
++    }
++
++    rvvm_free_machine(machine);
++
++    if (failures || any_fail) {
++        fprintf(stderr, "vgtest: FAILED (%d failures)\n", failures);
++        return 1;
++    }
++    printf("vgtest: PASSED\n");
++    return 0;
++}
+diff --git a/tests/virtio-gpu/vgtest_payload.c b/tests/virtio-gpu/vgtest_payload.c
+new file mode 100644
+index 0000000..4e758fb
+--- /dev/null
++++ b/tests/virtio-gpu/vgtest_payload.c
+@@ -0,0 +1,555 @@
++/*
++ * vgtest_payload.c - bare-metal RISC-V virtio-gpu exerciser for RVVM
++ *
++ * Runs in M-mode at 0x80000000 (loaded as "firmware"), talks to the
++ * virtio-gpu device at 0x10004000 over virtio-mmio, prints results
++ * over the ns16550a UART at 0x10000000.
++ *
++ * Build (zig cc cross compiler):
++ *   zig cc -target riscv64-freestanding-none -mcmodel=medany -nostdlib \
++ *        -ffreestanding -O2 -Wl,-Ttext=0x80000000 -Wl,--build-id=none \
++ *        -o vgtest.elf vgtest_payload.c
++ */
++
++typedef unsigned long long u64;
++typedef unsigned int u32;
++typedef unsigned short u16;
++typedef unsigned char u8;
++typedef unsigned long uintptr_t;
++
++#define UART_BASE 0x10000000UL
++#define VGPU_BASE 0x10004000UL
++
++/* virtio-mmio registers */
++#define VIRTIO_MMIO_MAGIC             0x000
++#define VIRTIO_MMIO_VERSION           0x004
++#define VIRTIO_MMIO_DEVICE_ID         0x008
++#define VIRTIO_MMIO_VENDOR_ID         0x00c
++#define VIRTIO_MMIO_DEVICE_FEATURES   0x010
++#define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
++#define VIRTIO_MMIO_DRIVER_FEATURES   0x020
++#define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
++#define VIRTIO_MMIO_QUEUE_SEL         0x030
++#define VIRTIO_MMIO_QUEUE_NUM_MAX     0x034
++#define VIRTIO_MMIO_QUEUE_NUM         0x038
++#define VIRTIO_MMIO_QUEUE_READY       0x044
++#define VIRTIO_MMIO_QUEUE_NOTIFY      0x050
++#define VIRTIO_MMIO_INTERRUPT_STATUS  0x060
++#define VIRTIO_MMIO_INTERRUPT_ACK     0x064
++#define VIRTIO_MMIO_STATUS            0x070
++#define VIRTIO_MMIO_QUEUE_DESC_LOW    0x080
++#define VIRTIO_MMIO_QUEUE_DESC_HIGH   0x084
++#define VIRTIO_MMIO_QUEUE_AVAIL_LOW   0x090
++#define VIRTIO_MMIO_QUEUE_AVAIL_HIGH  0x094
++#define VIRTIO_MMIO_QUEUE_USED_LOW    0x0a0
++#define VIRTIO_MMIO_QUEUE_USED_HIGH   0x0a4
++
++#define VIRTIO_STATUS_ACK         1
++#define VIRTIO_STATUS_DRIVER      2
++#define VIRTIO_STATUS_DRIVER_OK   4
++#define VIRTIO_STATUS_FEATURES_OK 8
++
++#define VIRTQ_DESC_F_NEXT  1
++#define VIRTQ_DESC_F_WRITE 2
++
++/* virtio-gpu commands & responses */
++#define CMD_GET_DISPLAY_INFO   0x0100
++#define CMD_RESOURCE_CREATE_2D 0x0101
++#define CMD_RESOURCE_UNREF     0x0102
++#define CMD_SET_SCANOUT        0x0103
++#define CMD_RESOURCE_FLUSH     0x0104
++#define CMD_TRANSFER_TO_HOST_2D 0x0105
++#define CMD_RESOURCE_ATTACH_BACKING 0x0106
++#define CMD_GET_EDID           0x0120
++#define CMD_UPDATE_CURSOR      0x0300
++#define CMD_MOVE_CURSOR        0x0301
++
++#define RESP_OK_NODATA        0x8000
++#define RESP_OK_DISPLAY_INFO  0x8100
++#define RESP_OK_EDID          0x8104
++#define RESP_ERR_INVALID_RESOURCE_ID 0x8203
++
++#define FMT_B8G8R8X8 2
++#define FMT_A8R8G8B8 3
++
++static volatile u8* const uart = (volatile u8*)UART_BASE;
++static volatile u32* const vgpu = (volatile u32*)VGPU_BASE;
++
++static void uart_putc(char c)
++{
++    *uart = (u8)c;
++}
++
++static void uart_puts(const char* s)
++{
++    while (*s) {
++        uart_putc(*s++);
++    }
++}
++
++static void uart_puthex(u32 v)
++{
++    static const char hex[] = "0123456789abcdef";
++    uart_puts("0x");
++    for (int i = 7; i >= 0; i--) {
++        uart_putc(hex[(v >> (i * 4)) & 0xF]);
++    }
++}
++
++static u32 mmio_read(u32 off)
++{
++    return vgpu[off / 4];
++}
++
++static void mmio_write(u32 off, u32 val)
++{
++    vgpu[off / 4] = val;
++}
++
++static void mmio_write64(u32 off_lo, u64 val)
++{
++    mmio_write(off_lo, (u32)(val & 0xFFFFFFFFU));
++    mmio_write(off_lo + 4, (u32)(val >> 32));
++}
++
++/*
++ * Virtqueues in static memory (physical RAM at link addresses)
++ */
++#define QNUM 32
++
++struct virtq_desc {
++    u64 addr;
++    u32 len;
++    u16 flags;
++    u16 next;
++} __attribute__((packed));
++
++struct virtq_avail_s {
++    u16 flags;
++    u16 idx;
++    u16 ring[QNUM];
++} __attribute__((packed));
++
++struct virtq_used_elem {
++    u32 id;
++    u32 len;
++} __attribute__((packed));
++
++struct virtq_used_s {
++    u16 flags;
++    u16 idx;
++    struct virtq_used_elem ring[QNUM];
++} __attribute__((packed));
++
++static struct virtq_desc ctrl_desc[QNUM] __attribute__((aligned(4096)));
++static struct virtq_avail_s ctrl_avail __attribute__((aligned(4096)));
++static struct virtq_used_s ctrl_used __attribute__((aligned(4096)));
++
++static struct virtq_desc cur_desc[QNUM] __attribute__((aligned(4096)));
++static struct virtq_avail_s cur_avail __attribute__((aligned(4096)));
++static struct virtq_used_s cur_used __attribute__((aligned(4096)));
++
++static u8 cmd_buf[4096] __attribute__((aligned(4096)));
++static u8 resp_buf[4096] __attribute__((aligned(4096)));
++static u32 fb64[64 * 64] __attribute__((aligned(4096)));
++static u32 cursor_img[8 * 8] __attribute__((aligned(4096)));
++
++static u16 ctrl_last_used = 0;
++static u16 cur_last_used = 0;
++
++static void barrier(void)
++{
++    __asm__ volatile("fence rw, rw" ::: "memory");
++}
++
++static void fail(const char* what, u32 code)
++{
++    uart_puts("VGTEST: FAIL ");
++    uart_puts(what);
++    uart_puts(" code=");
++    uart_puthex(code);
++    uart_putc('\n');
++    for (;;) {
++        __asm__ volatile("wfi");
++    }
++}
++
++static void ok(const char* what)
++{
++    uart_puts("VGTEST: ");
++    uart_puts(what);
++    uart_puts(" OK\n");
++}
++
++static void setup_queue(u32 qidx, void* desc, void* avail, void* used)
++{
++    mmio_write(VIRTIO_MMIO_QUEUE_SEL, qidx);
++    mmio_write(VIRTIO_MMIO_QUEUE_NUM, QNUM);
++    mmio_write64(VIRTIO_MMIO_QUEUE_DESC_LOW, (u64)(uintptr_t)desc);
++    mmio_write64(VIRTIO_MMIO_QUEUE_AVAIL_LOW, (u64)(uintptr_t)avail);
++    mmio_write64(VIRTIO_MMIO_QUEUE_USED_LOW, (u64)(uintptr_t)used);
++    mmio_write(VIRTIO_MMIO_QUEUE_READY, 1);
++}
++
++/*
++ * Send a control-queue command built in cmd_buf (cmd_len bytes),
++ * response lands in resp_buf. Returns response type.
++ */
++static u32 send_ctrl(u32 cmd_len)
++{
++    ctrl_desc[0].addr = (u64)(uintptr_t)cmd_buf;
++    ctrl_desc[0].len = cmd_len;
++    ctrl_desc[0].flags = VIRTQ_DESC_F_NEXT;
++    ctrl_desc[0].next = 1;
++
++    ctrl_desc[1].addr = (u64)(uintptr_t)resp_buf;
++    ctrl_desc[1].len = sizeof(resp_buf);
++    ctrl_desc[1].flags = VIRTQ_DESC_F_WRITE;
++    ctrl_desc[1].next = 0;
++
++    barrier();
++
++    ctrl_avail.ring[ctrl_avail.idx % QNUM] = 0;
++    ctrl_avail.idx++;
++
++    barrier();
++
++    mmio_write(VIRTIO_MMIO_QUEUE_NOTIFY, 0);
++
++    u32 spins = 0;
++    while (ctrl_used.idx == ctrl_last_used) {
++        if (++spins > 50000000U) {
++            fail("timeout", 0xDEAD);
++        }
++    }
++    ctrl_last_used = ctrl_used.idx;
++
++    /* Ack the interrupt */
++    u32 isr = mmio_read(VIRTIO_MMIO_INTERRUPT_STATUS);
++    if (isr & 1) {
++        mmio_write(VIRTIO_MMIO_INTERRUPT_ACK, 1);
++    }
++
++    return *(volatile u32*)resp_buf;
++}
++
++static u32 send_cursor(u32 cmd_len)
++{
++    cur_desc[0].addr = (u64)(uintptr_t)cmd_buf;
++    cur_desc[0].len = cmd_len;
++    cur_desc[0].flags = VIRTQ_DESC_F_NEXT;
++    cur_desc[0].next = 1;
++
++    cur_desc[1].addr = (u64)(uintptr_t)resp_buf;
++    cur_desc[1].len = sizeof(resp_buf);
++    cur_desc[1].flags = VIRTQ_DESC_F_WRITE;
++    cur_desc[1].next = 0;
++
++    barrier();
++
++    cur_avail.ring[cur_avail.idx % QNUM] = 0;
++    cur_avail.idx++;
++
++    barrier();
++
++    mmio_write(VIRTIO_MMIO_QUEUE_NOTIFY, 1);
++
++    u32 spins = 0;
++    while (cur_used.idx == cur_last_used) {
++        if (++spins > 50000000U) {
++            fail("cursor-timeout", 0xDEAD);
++        }
++    }
++    cur_last_used = cur_used.idx;
++
++    u32 isr = mmio_read(VIRTIO_MMIO_INTERRUPT_STATUS);
++    if (isr & 1) {
++        mmio_write(VIRTIO_MMIO_INTERRUPT_ACK, 1);
++    }
++
++    return *(volatile u32*)resp_buf;
++}
++
++static u32 le32(const u8* p)
++{
++    return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
++}
++
++static void wr32(u8* p, u32 v)
++{
++    p[0] = (u8)(v);
++    p[1] = (u8)(v >> 8);
++    p[2] = (u8)(v >> 16);
++    p[3] = (u8)(v >> 24);
++}
++
++void payload_main(void)
++{
++    uart_puts("VGTEST: start\n");
++
++    /* 1. Device identification */
++    u32 magic = mmio_read(VIRTIO_MMIO_MAGIC);
++    u32 version = mmio_read(VIRTIO_MMIO_VERSION);
++    u32 devid = mmio_read(VIRTIO_MMIO_DEVICE_ID);
++    u32 vendor = mmio_read(VIRTIO_MMIO_VENDOR_ID);
++    if (magic != 0x74726976 || version != 2 || devid != 0x10 || vendor != 0x5256564d) {
++        fail("ident", (magic << 0) | (version << 8));
++    }
++    ok("T1 ident");
++
++    /* 2. Feature negotiation */
++    mmio_write(VIRTIO_MMIO_STATUS, 0);
++    mmio_write(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER);
++
++    mmio_write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0);
++    u32 feat_lo = mmio_read(VIRTIO_MMIO_DEVICE_FEATURES);
++    mmio_write(VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1);
++    u32 feat_hi = mmio_read(VIRTIO_MMIO_DEVICE_FEATURES);
++
++    if (!(feat_lo & (1U << 1))) {
++        fail("edid-feature", feat_lo);
++    }
++    /* Accept EDID(bit1) + INDIRECT(28) + EVENT_IDX(29); no virgl */
++    u32 drv_lo = feat_lo & ((1U << 1) | (1U << 28) | (1U << 29));
++    u32 drv_hi = feat_hi & (1U << 0); /* VIRTIO_F_VERSION_1 */
++
++    mmio_write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
++    mmio_write(VIRTIO_MMIO_DRIVER_FEATURES, drv_lo);
++    mmio_write(VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
++    mmio_write(VIRTIO_MMIO_DRIVER_FEATURES, drv_hi);
++
++    mmio_write(VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
++    if (!(mmio_read(VIRTIO_MMIO_STATUS) & VIRTIO_STATUS_FEATURES_OK)) {
++        fail("features-ok", mmio_read(VIRTIO_MMIO_STATUS));
++    }
++    ok("T2 features");
++
++    /* 3. Queue setup */
++    setup_queue(0, ctrl_desc, &ctrl_avail, &ctrl_used);
++    setup_queue(1, cur_desc, &cur_avail, &cur_used);
++    mmio_write(VIRTIO_MMIO_STATUS,
++               VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
++    ok("T3 queues");
++
++    /* 4. GET_DISPLAY_INFO */
++    wr32(cmd_buf + 0, CMD_GET_DISPLAY_INFO);
++    u32 r = send_ctrl(24);
++    if (r != RESP_OK_DISPLAY_INFO) {
++        fail("T4 display-info", r);
++    }
++    /* hdr(24) + pmode[0] {x,y,w,h,enabled,flags} */
++    u32 dw = le32(resp_buf + 24 + 8);
++    u32 dh = le32(resp_buf + 24 + 12);
++    u32 en = le32(resp_buf + 24 + 16);
++    u32 en1 = le32(resp_buf + 24 + 24 + 16);
++    if (dw != 1280 || dh != 800 || en != 1 || en1 != 0) {
++        fail("T4 display-info-values", (dw << 0) | (dh << 16));
++    }
++    ok("T4 display-info");
++
++    /* 5. GET_EDID */
++    wr32(cmd_buf + 0, CMD_GET_EDID);
++    wr32(cmd_buf + 24, 0); /* scanout 0 */
++    r = send_ctrl(24 + 8);
++    if (r != RESP_OK_EDID) {
++        fail("T5 edid", r);
++    }
++    u32 esize = le32(resp_buf + 24);
++    if (esize != 128) {
++        fail("T5 edid-size", esize);
++    }
++    const u8* edid = resp_buf + 32;
++    if (edid[0] != 0x00 || edid[1] != 0xFF || edid[2] != 0xFF || edid[3] != 0xFF || edid[7] != 0x00) {
++        fail("T5 edid-header", edid[1]);
++    }
++    u32 sum = 0;
++    for (u32 i = 0; i < 128; i++) {
++        sum += edid[i];
++    }
++    if ((sum & 0xFF) != 0) {
++        fail("T5 edid-checksum", sum & 0xFF);
++    }
++    ok("T5 edid");
++
++    /* 6. RESOURCE_UNREF on nonexistent id -> error */
++    wr32(cmd_buf + 0, CMD_RESOURCE_UNREF);
++    wr32(cmd_buf + 24, 42); /* nonexistent resource id */
++    r = send_ctrl(24 + 8);
++    if (r != RESP_ERR_INVALID_RESOURCE_ID) {
++        fail("T6 unref-bad-id", r);
++    }
++    ok("T6 unref-bad-id");
++
++    /* 7. RESOURCE_CREATE_2D 64x64 B8G8R8X8 */
++    wr32(cmd_buf + 0, CMD_RESOURCE_CREATE_2D);
++    wr32(cmd_buf + 24, 1); /* resource id */
++    wr32(cmd_buf + 28, FMT_B8G8R8X8);
++    wr32(cmd_buf + 32, 64);
++    wr32(cmd_buf + 36, 64);
++    r = send_ctrl(24 + 16);
++    if (r != RESP_OK_NODATA) {
++        fail("T7 create-2d", r);
++    }
++    ok("T7 create-2d");
++
++    /* 8. ATTACH_BACKING */
++    wr32(cmd_buf + 0, CMD_RESOURCE_ATTACH_BACKING);
++    wr32(cmd_buf + 24, 1);  /* resource id */
++    wr32(cmd_buf + 28, 1);  /* nr_entries */
++    wr32(cmd_buf + 32, (u32)((u64)(uintptr_t)fb64 & 0xFFFFFFFFU));
++    wr32(cmd_buf + 36, (u32)((u64)(uintptr_t)fb64 >> 32));
++    wr32(cmd_buf + 40, 64 * 64 * 4);
++    wr32(cmd_buf + 44, 0);
++    r = send_ctrl(24 + 8 + 16);
++    if (r != RESP_OK_NODATA) {
++        fail("T8 attach-backing", r);
++    }
++    ok("T8 attach-backing");
++
++    /* 9. Fill guest buffer: pixel(x,y) = {B=0xFF-2y, G=4x, R=0x80, X=0} */
++    for (u32 y = 0; y < 64; y++) {
++        for (u32 x = 0; x < 64; x++) {
++            u32 px = (0x80U << 16) | ((x * 4) << 8) | (0xFFU - 2 * y);
++            fb64[y * 64 + x] = px;
++        }
++    }
++
++    /* 10. TRANSFER_TO_HOST_2D with fence */
++    wr32(cmd_buf + 0, CMD_TRANSFER_TO_HOST_2D);
++    wr32(cmd_buf + 4, 1); /* VIRTIO_GPU_FLAG_FENCE */
++    *(volatile u64*)(cmd_buf + 8) = 0x1234; /* fence id */
++    wr32(cmd_buf + 24, 0); /* rect.x */
++    wr32(cmd_buf + 28, 0); /* rect.y */
++    wr32(cmd_buf + 32, 64); /* rect.w */
++    wr32(cmd_buf + 36, 64); /* rect.h */
++    *(volatile u64*)(cmd_buf + 40) = 0; /* offset */
++    wr32(cmd_buf + 48, 1); /* resource id */
++    r = send_ctrl(24 + 32);
++    if (r != RESP_OK_NODATA) {
++        fail("T10 transfer", r);
++    }
++    u64 rfid = *(volatile u64*)(resp_buf + 8);
++    if (rfid != 0x1234) {
++        fail("T10 fence-id", (u32)rfid);
++    }
++    ok("T10 transfer+fence");
++
++    /* 11. SET_SCANOUT */
++    wr32(cmd_buf + 0, CMD_SET_SCANOUT);
++    wr32(cmd_buf + 24, 0);
++    wr32(cmd_buf + 28, 0);
++    wr32(cmd_buf + 32, 64);
++    wr32(cmd_buf + 36, 64);
++    wr32(cmd_buf + 40, 0); /* scanout id */
++    wr32(cmd_buf + 44, 1); /* resource id */
++    r = send_ctrl(24 + 24);
++    if (r != RESP_OK_NODATA) {
++        fail("T11 set-scanout", r);
++    }
++    ok("T11 set-scanout");
++
++    /* 12. FLUSH */
++    wr32(cmd_buf + 0, CMD_RESOURCE_FLUSH);
++    wr32(cmd_buf + 24, 0);
++    wr32(cmd_buf + 28, 0);
++    wr32(cmd_buf + 32, 64);
++    wr32(cmd_buf + 36, 64);
++    wr32(cmd_buf + 40, 1); /* resource id */
++    wr32(cmd_buf + 44, 0); /* padding */
++    r = send_ctrl(24 + 24);
++    if (r != RESP_OK_NODATA) {
++        fail("T12 flush", r);
++    }
++    ok("T12 flush");
++
++    /* 13. Cursor: create 8x8 A8R8G8B8 resource, attach, transfer, update, move */
++    wr32(cmd_buf + 0, CMD_RESOURCE_CREATE_2D);
++    wr32(cmd_buf + 24, 3); /* resource id */
++    wr32(cmd_buf + 28, FMT_A8R8G8B8);
++    wr32(cmd_buf + 32, 8);
++    wr32(cmd_buf + 36, 8);
++    r = send_ctrl(24 + 16);
++    if (r != RESP_OK_NODATA) {
++        fail("T13 cursor-create", r);
++    }
++
++    wr32(cmd_buf + 0, CMD_RESOURCE_ATTACH_BACKING);
++    wr32(cmd_buf + 24, 3);
++    wr32(cmd_buf + 28, 1);
++    wr32(cmd_buf + 32, (u32)((u64)(uintptr_t)cursor_img & 0xFFFFFFFFU));
++    wr32(cmd_buf + 36, (u32)((u64)(uintptr_t)cursor_img >> 32));
++    wr32(cmd_buf + 40, 8 * 8 * 4);
++    wr32(cmd_buf + 44, 0);
++    r = send_ctrl(24 + 8 + 16);
++    if (r != RESP_OK_NODATA) {
++        fail("T13 cursor-attach", r);
++    }
++
++    for (u32 i = 0; i < 64; i++) {
++        cursor_img[i] = 0xFF00FF00U; /* opaque green {A=0,R=FF,G=0,B=0}? see A8R8G8B8 layout */
++    }
++
++    wr32(cmd_buf + 0, CMD_TRANSFER_TO_HOST_2D);
++    wr32(cmd_buf + 4, 0);
++    *(volatile u64*)(cmd_buf + 8) = 0;
++    wr32(cmd_buf + 24, 0);
++    wr32(cmd_buf + 28, 0);
++    wr32(cmd_buf + 32, 8);
++    wr32(cmd_buf + 36, 8);
++    *(volatile u64*)(cmd_buf + 40) = 0;
++    wr32(cmd_buf + 48, 3);
++    r = send_ctrl(24 + 32);
++    if (r != RESP_OK_NODATA) {
++        fail("T13 cursor-transfer", r);
++    }
++
++    /* UPDATE_CURSOR on the cursor queue */
++    wr32(cmd_buf + 0, CMD_UPDATE_CURSOR);
++    wr32(cmd_buf + 24, 0xFFFFFFFFU); /* pos.scanout_id (all) */
++    wr32(cmd_buf + 28, 10);          /* pos.x */
++    wr32(cmd_buf + 32, 20);          /* pos.y */
++    wr32(cmd_buf + 36, 0);           /* pos.padding */
++    wr32(cmd_buf + 40, 3);           /* resource id */
++    wr32(cmd_buf + 44, 2);           /* hot_x */
++    wr32(cmd_buf + 48, 2);           /* hot_y */
++    wr32(cmd_buf + 52, 0);           /* padding */
++    r = send_cursor(24 + 32);
++    if (r != RESP_OK_NODATA) {
++        fail("T13 cursor-update", r);
++    }
++
++    /* MOVE_CURSOR */
++    wr32(cmd_buf + 0, CMD_MOVE_CURSOR);
++    wr32(cmd_buf + 24, 0xFFFFFFFFU);
++    wr32(cmd_buf + 28, 30);
++    wr32(cmd_buf + 32, 40);
++    wr32(cmd_buf + 36, 0);
++    wr32(cmd_buf + 40, 3);
++    r = send_cursor(24 + 24);
++    if (r != RESP_OK_NODATA) {
++        fail("T13 cursor-move", r);
++    }
++    ok("T13 cursor");
++
++    uart_puts("VGTEST: ALL PASS\n");
++    for (;;) {
++        __asm__ volatile("wfi");
++    }
++}
++
++__attribute__((naked, section(".text.init"))) void _start(void)
++{
++    __asm__ volatile(
++        ".option push\n"
++        ".option norelax\n"
++        "la gp, __global_pointer$\n"
++        ".option pop\n"
++        "la sp, __stack_top\n"
++        "call payload_main\n"
++        "1: wfi\n"
++        "j 1b\n");
++}
++
++/* 16KiB stack, exported top address for _start */
++u8 stack[16384] __attribute__((aligned(16), used));
++__asm__(".globl __stack_top\n.set __stack_top, stack + 16384\n");
+-- 
+2.39.5
+
