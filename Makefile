@@ -7,46 +7,40 @@ APPLICATION_NAME = rvvm
 
 RVVM_DIR ?= RVVM
 
+# Fetch upstream RVVM at the pinned commit and apply patches/*.patch.
+# Runs at parse time because the source lists below are wildcards.
+$(shell sh scripts/prepare-rvvm.sh "$(RVVM_DIR)" 1>&2)
+
+# RVVM sources compiled into the app. This is upstream's librvvm object set
+# minus the desktop-only parts: GUI backends, the standalone main, the user-mode
+# runner, the Linux TAP/ALSA/VFIO backends, and the isolation hook.
+RVVM_CORE = gdbstub rvvm rvvm_blk rvvm_fbdev rvvm_fdt rvvm_irq rvvm_isolation rvvm_pci rvvm_region rvvm_snapshot
+RVVM_DEVICES = \
+	bochs-display chardev_term eth-oc framebuffer hid-keyboard hid-mouse i2c-hid i2c-oc \
+	ns16550a nvme ps2-altera ps2-keyboard ps2-mouse riscv-aclint riscv-plic syscon \
+	rtc-goldfish rtl8169 tap_user virtio-fs virtio-gpu virtio-input
+
 rvvm_FILES = \
 	main.m \
 	RV64AppDelegate.m \
 	RV64RootViewController.m \
 	RV64Runner.mm \
-	$(filter-out $(RVVM_DIR)/src/main.c,$(wildcard $(RVVM_DIR)/src/*.c)) \
+	$(foreach f,$(RVVM_CORE),$(RVVM_DIR)/src/core/$(f).c) \
 	$(wildcard $(RVVM_DIR)/src/cpu/*.c) \
-	$(RVVM_DIR)/src/devices/chardev_term.c \
-	$(RVVM_DIR)/src/devices/bochs-display.c \
-	$(RVVM_DIR)/src/devices/framebuffer.c \
-	$(RVVM_DIR)/src/devices/pci-bus.c \
-	$(RVVM_DIR)/src/devices/riscv-aclint.c \
-	$(RVVM_DIR)/src/devices/riscv-plic.c \
-	$(RVVM_DIR)/src/devices/i2c-oc.c \
-	$(RVVM_DIR)/src/devices/i2c-hid.c \
-	$(RVVM_DIR)/src/devices/hid-keyboard.c \
-	$(RVVM_DIR)/src/devices/hid-mouse.c \
-	$(RVVM_DIR)/src/devices/ns16550a.c \
-	$(RVVM_DIR)/src/devices/ps2-altera.c \
-	$(RVVM_DIR)/src/devices/ps2-keyboard.c \
-	$(RVVM_DIR)/src/devices/ps2-mouse.c \
-	$(RVVM_DIR)/src/devices/syscon.c \
-	$(RVVM_DIR)/src/devices/rtc-goldfish.c \
-	$(RVVM_DIR)/src/devices/virtio-fs.c \
-	$(RVVM_DIR)/src/devices/virtio-input.c \
-	$(RVVM_DIR)/src/devices/tap_user.c \
-	$(RVVM_DIR)/src/devices/rtl8169.c \
-	$(RVVM_DIR)/src/devices/nvme.c \
-	$(RVVM_DIR)/src/devices/eth-oc.c
+	$(wildcard $(RVVM_DIR)/src/util/*.c) \
+	$(wildcard $(RVVM_DIR)/src/rvjit/*.c) \
+	$(foreach f,$(RVVM_DEVICES),$(RVVM_DIR)/src/devices/$(f).c)
 
-rvvm_FRAMEWORKS = UIKit Foundation WebKit
+rvvm_FRAMEWORKS = UIKit Foundation WebKit AVFoundation
 rvvm_LIBRARIES = pthread
 
 rvvm_CFLAGS = -fobjc-arc
 rvvm_CFLAGS += -O3
 rvvm_CFLAGS += -std=gnu11
-rvvm_CFLAGS += -UUSE_JIT
+rvvm_CFLAGS += -DUSE_JIT
 rvvm_CFLAGS += -Wno-error=ignored-pragmas
 rvvm_CFLAGS += -DNDEBUG -DUSE_RV64 -DUSE_FDT -DUSE_FPU -DUSE_NET
-rvvm_CFLAGS += -I$(RVVM_DIR)/include -I$(RVVM_DIR)/src
+rvvm_CFLAGS += $(RVVM_INCFLAGS)
 
 rvvm_CCFLAGS = \
 	-std=gnu++20 \
@@ -56,14 +50,19 @@ rvvm_CCFLAGS = \
 	-DUSE_FDT \
 	-DUSE_FPU \
 	-DUSE_NET \
-	-UUSE_JIT \
+	-DUSE_JIT \
 	-Wno-error=ignored-pragmas \
-	-I$(RVVM_DIR)/include \
-	-I$(RVVM_DIR)/src
+	$(RVVM_INCFLAGS)
 
 rvvm_OBJCCFLAGS = $(rvvm_CCFLAGS)
 
+# Upstream sources include sibling headers by bare name, so every subdirectory is on the path.
+RVVM_INCFLAGS = -I$(RVVM_DIR)/include $(patsubst %,-I%,$(wildcard $(RVVM_DIR)/src $(RVVM_DIR)/src/*/))
+
 rvvm_RESOURCE_DIRS = Resources
+
+# JIT (StikDebug enables it at runtime) and increased memory limit need entitlements.
+rvvm_CODESIGN_FLAGS = -Sentitlements.plist
 
 include $(THEOS_MAKE_PATH)/application.mk
 

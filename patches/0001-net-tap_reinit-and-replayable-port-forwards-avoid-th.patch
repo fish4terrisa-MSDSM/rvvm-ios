@@ -1,0 +1,369 @@
+From e264cf9785dcfeb2aa6c2dc04d7f191860ef1490 Mon Sep 17 00:00:00 2001
+From: rvvm-ios port <port@rvvm-ios.local>
+Date: Fri, 9 Oct 2026 06:58:57 +0000
+Subject: [PATCH 1/5] net: tap_reinit and replayable port forwards; avoid
+ thread_create macro clash on Darwin
+
+Port tap_reinit() from the iOS fork. Port-forward rules are recorded so
+they can be re-bound after the network stack is reset.
+
+The thread_create macro in threading.h collided with the Mach
+thread_create() declaration on Darwin. Callers now use rvvm_thread_create
+directly.
+---
+ src/core/gdbstub.c         |   2 +-
+ src/core/rvvm.c            |   2 +-
+ src/cpu/riscv_hart.c       |   2 +-
+ src/devices/chardev_term.c |   2 +-
+ src/devices/tap_api.h      |   3 ++
+ src/devices/tap_linux.c    |  53 +++++++++++++++++++-
+ src/devices/tap_user.c     | 100 ++++++++++++++++++++++++++++++++++++-
+ src/gui/wayland_window.c   |   2 +-
+ src/gui/x11_window.c       |   2 +-
+ src/util/rcu_lib.c         |   4 +-
+ src/util/threading.h       |   1 -
+ 11 files changed, 161 insertions(+), 12 deletions(-)
+
+diff --git a/src/core/gdbstub.c b/src/core/gdbstub.c
+index 7ebd496..9e9bac0 100644
+--- a/src/core/gdbstub.c
++++ b/src/core/gdbstub.c
+@@ -606,7 +606,7 @@ static gdb_server_t* gdbstub_create(const char* bind)
+         return NULL;
+     }
+ 
+-    server->thread = thread_create(gdbstub_thread, server);
++    server->thread = rvvm_thread_create(gdbstub_thread, server);
+ 
+     return server;
+ }
+diff --git a/src/core/rvvm.c b/src/core/rvvm.c
+index f22a515..9156eff 100644
+--- a/src/core/rvvm.c
++++ b/src/core/rvvm.c
+@@ -461,7 +461,7 @@ static void rvvm_reconfigure_eventloop(void)
+             eventloop_cond = condvar_create();
+         }
+         if (needs_thread && !eventloop_thread) {
+-            eventloop_thread = thread_create(rvvm_eventloop, NULL);
++            eventloop_thread = rvvm_thread_create(rvvm_eventloop, NULL);
+         }
+     }
+ #endif
+diff --git a/src/cpu/riscv_hart.c b/src/cpu/riscv_hart.c
+index 48f7ef1..cd50b71 100644
+--- a/src/cpu/riscv_hart.c
++++ b/src/cpu/riscv_hart.c
+@@ -466,7 +466,7 @@ void riscv_hart_spawn(rvvm_hart_t* vm)
+ {
+     if (!vm->thread) {
+         atomic_store_uint32(&vm->pending_events, 0);
+-        vm->thread = thread_create(riscv_hart_run_thread, vm);
++        vm->thread = rvvm_thread_create(riscv_hart_run_thread, vm);
+     }
+ }
+ 
+diff --git a/src/devices/chardev_term.c b/src/devices/chardev_term.c
+index f9b1159..1fdb257 100644
+--- a/src/devices/chardev_term.c
++++ b/src/devices/chardev_term.c
+@@ -166,7 +166,7 @@ static size_t term_read_raw(chardev_term_t* term, char* buffer, size_t size)
+ {
+     UNUSED(term && buffer && size);
+ #if defined(HOST_TARGET_EMSCRIPTEN)
+-    DO_ONCE(thread_create(input_worker, (void*)(size_t)term->rfd));
++    DO_ONCE(rvvm_thread_create(input_worker, (void*)(size_t)term->rfd));
+     uint32_t ret = EVAL_MIN(atomic_load_uint32(&input_amount), size);
+     if (ret) {
+         memcpy(buffer, input_buffer, ret);
+diff --git a/src/devices/tap_api.h b/src/devices/tap_api.h
+index a25d975..bd59f37 100644
+--- a/src/devices/tap_api.h
++++ b/src/devices/tap_api.h
+@@ -42,6 +42,9 @@ PUBLIC bool tap_set_mac(tap_dev_t* tap, const uint8_t mac[6]);
+ // Format: "tcp/2022=22"; "[::1]:2022=22"; "127.0.0.1:2022=192.168.0.101:22"
+ PUBLIC bool tap_portfwd(tap_dev_t* tap, const char* fwd);
+ 
++// Reinitialize backend networking state (drop active connections, keep attachment)
++PUBLIC bool tap_reinit(tap_dev_t* tap);
++
+ // Set the host interface addr for this TAP interface
+ PUBLIC bool tap_ifaddr(tap_dev_t* tap, const char* addr);
+ 
+diff --git a/src/devices/tap_linux.c b/src/devices/tap_linux.c
+index 1b627c8..853b02e 100644
+--- a/src/devices/tap_linux.c
++++ b/src/devices/tap_linux.c
+@@ -125,7 +125,7 @@ void tap_attach(tap_dev_t* tap, const tap_net_dev_t* net_dev)
+     if (tap->net.feed_rx == NULL) {
+         tap->net = *net_dev;
+         // Run TAP thread
+-        tap->thread = thread_create(tap_thread, tap);
++        tap->thread = rvvm_thread_create(tap_thread, tap);
+     }
+ }
+ 
+@@ -161,6 +161,57 @@ bool tap_portfwd(tap_dev_t* tap, const char* fwd)
+     return false;
+ }
+ 
++bool tap_reinit(tap_dev_t* tap)
++{
++    if (!tap) {
++        return false;
++    }
++
++    if (tap->thread) {
++        close(tap->shut[1]);
++        thread_join(tap->thread);
++        tap->thread = NULL;
++    }
++
++    if (tap->fd >= 0) {
++        close(tap->fd);
++        tap->fd = -1;
++    }
++    close(tap->shut[0]);
++
++    tap->fd = open("/dev/net/tun", O_RDWR);
++    if (tap->fd < 0) {
++        return false;
++    }
++
++    struct ifreq ifr = {0};
++    rvvm_strlcpy(ifr.ifr_name, "tap0", sizeof(ifr.ifr_name));
++    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
++    if (ioctl(tap->fd, TUNSETIFF, &ifr) < 0) {
++        close(tap->fd);
++        tap->fd = -1;
++        return false;
++    }
++    rvvm_strlcpy(tap->name, ifr.ifr_name, sizeof(tap->name));
++
++    if (pipe(tap->shut) < 0) {
++        close(tap->fd);
++        tap->fd = -1;
++        return false;
++    }
++
++    int sock = socket(AF_INET, SOCK_DGRAM, 0);
++    ioctl(sock, SIOCGIFFLAGS, &ifr);
++    ifr.ifr_flags |= IFF_UP;
++    ioctl(sock, SIOCSIFFLAGS, &ifr);
++    close(sock);
++
++    if (tap->net.feed_rx) {
++        tap->thread = rvvm_thread_create(tap_thread, tap);
++    }
++    return tap->thread != NULL;
++}
++
+ void tap_close(tap_dev_t* tap)
+ {
+     // Shut down the TAP thread
+diff --git a/src/devices/tap_user.c b/src/devices/tap_user.c
+index 40c8e4c..ab42289 100644
+--- a/src/devices/tap_user.c
++++ b/src/devices/tap_user.c
+@@ -10,6 +10,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+ 
+ #include "tap_api.h"
++
++#include <string.h>
+ #include "networking.h"
+ #include "threading.h"
+ #include "spinlock.h"
+@@ -125,6 +127,7 @@ typedef struct {
+ } tap_sock_t;
+ 
+ typedef vector_t(tap_sock_t*) ts_vec_t;
++typedef vector_t(char*) portfwd_vec_t;
+ 
+ struct tap_dev {
+     spinlock_t    lock;
+@@ -134,6 +137,7 @@ struct tap_dev {
+     hashmap_t     icmp_ids;
+     hashmap_t     tcp_map;
+     ts_vec_t      tcp_listeners;
++    portfwd_vec_t portfwds;
+     thread_ctx_t* thread;
+     net_sock_t*   shut[2];
+     uint8_t       mac[6];
+@@ -1175,11 +1179,11 @@ void tap_attach(tap_dev_t* tap, const tap_net_dev_t* net_dev)
+ {
+     if (tap->net.feed_rx == NULL) {
+         tap->net = *net_dev;
+-        tap->thread = thread_create(tap_thread, tap);
++        tap->thread = rvvm_thread_create(tap_thread, tap);
+     }
+ }
+ 
+-bool tap_portfwd(tap_dev_t* tap, const char* fwd)
++static bool tap_portfwd_internal(tap_dev_t* tap, const char* fwd, bool store_rule)
+ {
+     net_addr_t host = {0}, guest = {0};
+     const char* parse = fwd;
+@@ -1222,12 +1226,104 @@ bool tap_portfwd(tap_dev_t* tap, const char* fwd)
+     if (!ret) {
+         rvvm_error("Failed to forward port %s", fwd);
+         if (host.port && host.port < 1024) rvvm_error("Binding ports below 1024 requires root/admin privilege");
++    } else if (store_rule) {
++        // Remember the rule, so it can be re-bound after tap_reinit()
++        size_t fwd_len = rvvm_strlen(fwd);
++        char* copy = malloc(fwd_len + 1);
++        if (copy) {
++            memcpy(copy, fwd, fwd_len + 1);
++            vector_push_back(tap->portfwds, copy);
++        }
+     }
+     return ret;
+ }
+ 
++bool tap_portfwd(tap_dev_t* tap, const char* fwd)
++{
++    return tap_portfwd_internal(tap, fwd, true);
++}
++
++bool tap_reinit(tap_dev_t* tap)
++{
++    if (!tap) {
++        return false;
++    }
++
++    net_sock_close(tap->shut[1]);
++    if (tap->thread) {
++        thread_join(tap->thread);
++        tap->thread = NULL;
++    }
++
++    spin_lock(&tap->lock);
++    hashmap_foreach(&tap->tcp_map, hash, ts_val) {
++        ts_vec_t* vec = (ts_vec_t*)ts_val;
++        UNUSED(hash);
++        vector_foreach_back(*vec, i) {
++            tap_tcp_close(NULL, vector_at(*vec, i));
++        }
++        vector_free(*vec);
++        free(vec);
++    }
++    hashmap_foreach(&tap->udp_ports, port, ts_val) {
++        UNUSED(port);
++        tap_sock_t* ts = (tap_sock_t*)ts_val;
++        net_poll_remove(tap->poll, ts->sock);
++        net_sock_close(ts->sock);
++        free(ts);
++    }
++    hashmap_foreach(&tap->icmp_ids, id, ts_val) {
++        UNUSED(id);
++        tap_sock_t* ts = (tap_sock_t*)ts_val;
++        net_poll_remove(tap->poll, ts->sock);
++        net_sock_close(ts->sock);
++        free(ts);
++    }
++    vector_foreach(tap->tcp_listeners, i) {
++        tap_sock_t* ts = vector_at(tap->tcp_listeners, i);
++        net_poll_remove(tap->poll, ts->sock);
++        tap_tcp_close(NULL, ts);
++    }
++    vector_free(tap->tcp_listeners);
++    tap->tcp_listeners = (ts_vec_t){0};
++
++    hashmap_destroy(&tap->udp_ports);
++    hashmap_destroy(&tap->icmp_ids);
++    hashmap_destroy(&tap->tcp_map);
++    hashmap_init(&tap->udp_ports, 16);
++    hashmap_init(&tap->icmp_ids, 16);
++    hashmap_init(&tap->tcp_map, 16);
++
++    net_sock_close(tap->shut[0]);
++    net_poll_close(tap->poll);
++    tap->poll = net_poll_create();
++    if (!tap->poll) {
++        spin_unlock(&tap->lock);
++        return false;
++    }
++
++    net_tcp_sockpair(tap->shut);
++    net_event_t event = { .data = NULL, };
++    net_poll_add(tap->poll, tap->shut[0], &event);
++    spin_unlock(&tap->lock);
++
++    vector_foreach(tap->portfwds, i) {
++        tap_portfwd_internal(tap, vector_at(tap->portfwds, i), false);
++    }
++
++    if (tap->net.feed_rx) {
++        tap->thread = rvvm_thread_create(tap_thread, tap);
++    }
++    return tap->thread != NULL;
++}
++
+ void tap_close(tap_dev_t* tap)
+ {
++    // Forget stored port forwarding rules
++    vector_foreach(tap->portfwds, pf_i) {
++        free(vector_at(tap->portfwds, pf_i));
++    }
++    vector_free(tap->portfwds);
+     // Shut down the TAP thread
+     net_sock_close(tap->shut[1]);
+     thread_join(tap->thread);
+diff --git a/src/gui/wayland_window.c b/src/gui/wayland_window.c
+index 4f0eee8..946b348 100644
+--- a/src/gui/wayland_window.c
++++ b/src/gui/wayland_window.c
+@@ -907,7 +907,7 @@ static bool wayland_global_init(void)
+     }
+ 
+     // Launch the event thread
+-    wl_thread = thread_create(wl_event_worker, NULL);
++    wl_thread = rvvm_thread_create(wl_event_worker, NULL);
+ 
+     return !!wl_thread;
+ }
+diff --git a/src/gui/x11_window.c b/src/gui/x11_window.c
+index 6809532..bb58246 100644
+--- a/src/gui/x11_window.c
++++ b/src/gui/x11_window.c
+@@ -736,7 +736,7 @@ static bool x11_global_init(void)
+             rvvm_error("Failed to connect to X11 Display: Error code %d", error);
+             return false;
+         }
+-        x11_thread = thread_create(x11_event_worker, (void*)(size_t)ConnectionNumber(x11_display));
++        x11_thread = rvvm_thread_create(x11_event_worker, (void*)(size_t)ConnectionNumber(x11_display));
+     }
+     return !!x11_thread;
+ }
+diff --git a/src/util/rcu_lib.c b/src/util/rcu_lib.c
+index 0d3ae54..689bb1f 100644
+--- a/src/util/rcu_lib.c
++++ b/src/util/rcu_lib.c
+@@ -239,10 +239,10 @@ void rcu_torture_test(uint32_t reader_threads, uint32_t secs)
+     }
+ 
+     for (uint32_t i = 0; i < reader_threads; ++i) {
+-        thread_create(rcu_torture_read_worker, NULL);
++        rvvm_thread_create(rcu_torture_read_worker, NULL);
+     }
+ 
+-    thread_create(rcu_torture_write_worker, NULL);
++    rvvm_thread_create(rcu_torture_write_worker, NULL);
+ 
+     for (uint32_t i = 0; i < secs; ++i) {
+         sleep_ms(1000);
+diff --git a/src/util/threading.h b/src/util/threading.h
+index 8d89d38..2899ed2 100644
+--- a/src/util/threading.h
++++ b/src/util/threading.h
+@@ -86,7 +86,6 @@ void         rvvm_task_free(rvvm_task_t* task);
+  */
+ 
+ #define thread_ctx_t          rvvm_thread_t
+-#define thread_create         rvvm_thread_create
+ #define thread_join           rvvm_thread_join
+ #define thread_detach         rvvm_thread_detach
+ 
+-- 
+2.39.5
+

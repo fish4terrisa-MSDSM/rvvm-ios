@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Raises the per-app memory ceiling so VMs above the default RAM limit can run. Granted to free developer signing. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<!-- JIT: StikDebug attaches and enables CS_DEBUGGED at runtime. These let RVVM map executable pages. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<!-- Required so a debugger (StikDebug) can attach to the process for JIT. -->
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

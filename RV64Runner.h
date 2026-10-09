@@ -24,6 +24,7 @@ extern NSString * const RV64RunnerFramebufferStrideKey;
 extern NSString * const RV64RunnerFramebufferFormatKey;
 
 @interface RV64Runner : NSObject
++ (BOOL)isRunning;
 + (void)startLinux;
 + (void)requestRestart;
 + (void)reinitNetwork;
@@ -55,6 +56,22 @@ extern NSString * const RV64RunnerFramebufferFormatKey;
 + (void)sendVirtioMouseAbsX:(int32_t)x absY:(int32_t)y;
 + (void)sendVirtioMouseButtons:(uint8_t)btnMask down:(BOOL)down;
 + (void)sendVirtioMouseScroll:(int32_t)offset;
+// Disk images (raw, sparse). Names are relative to the Documents folder.
+// All operations refuse to run while the VM is running.
++ (BOOL)createDiskImageNamed:(NSString *)name
+                   sizeBytes:(unsigned long long)sizeBytes
+                       error:(NSString * _Nullable * _Nullable)errorOut;
++ (BOOL)expandDiskImageNamed:(NSString *)name
+                 toSizeBytes:(unsigned long long)sizeBytes
+                       error:(NSString * _Nullable * _Nullable)errorOut;
++ (BOOL)sparsifyDiskImageNamed:(NSString *)name
+                         error:(NSString * _Nullable * _Nullable)errorOut;
++ (BOOL)importDiskImageFromPath:(NSString *)sourcePath
+                         asName:(NSString *)name
+                          error:(NSString * _Nullable * _Nullable)errorOut;
++ (BOOL)importFirmwareFromPath:(NSString *)sourcePath
+                          name:(NSString * _Nullable * _Nullable)nameOut
+                         error:(NSString * _Nullable * _Nullable)errorOut;
 + (void)setVirtioFSDebugToUARTEnabled:(BOOL)enabled;
 + (NSArray<NSString *> *)virtioFSDebugLines;
 + (void)clearVirtioFSDebug;

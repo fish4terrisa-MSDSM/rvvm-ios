@@ -15,6 +15,12 @@ static NSString *const kRVVMDefaultsDiskFilename = @"rvvm.diskFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
 static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
 static NSString *const kRVVMDefaultsAutoLoadSnapshot = @"rvvm.autoLoadSnapshot";
+static NSString *const kRVVMDefaultsGPUMode = @"rvvm.gpuMode";
+static NSString *const kRVVMDefaultsTouchMode = @"rvvm.touchMode";
+static NSString *const kRVVMDefaultsBackgroundMode = @"rvvm.backgroundMode";
+static NSString *const kRVVMDefaultsFirmwareFilename = @"rvvm.firmwareFilename";
+static NSString *const kRVVMDefaultsExtraDisks = @"rvvm.extraDisks";
+static NSString *const kRVVMDefaultsSharesEnabled = @"rvvm.sharesEnabled";
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -362,15 +368,77 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[self.inputViewHidden resignFirstResponder];
 }
 
+// Direct touch: map a point on the framebuffer image (aspect fit) to guest pixels.
+- (BOOL)guestPointForGesture:(UIGestureRecognizer *)gr x:(int32_t *)xOut y:(int32_t *)yOut
+{
+	if (self.fbWidth == 0 || self.fbHeight == 0) {
+		return NO;
+	}
+	CGRect b = self.imageView.bounds;
+	if (b.size.width <= 0 || b.size.height <= 0) {
+		return NO;
+	}
+	const CGFloat fw = (CGFloat)self.fbWidth;
+	const CGFloat fh = (CGFloat)self.fbHeight;
+	const CGFloat scale = MIN(b.size.width / fw, b.size.height / fh);
+	const CGFloat drawW = fw * scale;
+	const CGFloat drawH = fh * scale;
+	const CGFloat originX = (b.size.width - drawW) / 2.0;
+	const CGFloat originY = (b.size.height - drawH) / 2.0;
+	CGPoint p = [gr locationInView:self.imageView];
+	CGFloat gx = (p.x - originX) / scale;
+	CGFloat gy = (p.y - originY) / scale;
+	if (gx < 0 || gy < 0 || gx >= fw || gy >= fh) {
+		return NO;
+	}
+	*xOut = (int32_t)MIN(MAX((int32_t)gx, 0), (int32_t)self.fbWidth - 1);
+	*yOut = (int32_t)MIN(MAX((int32_t)gy, 0), (int32_t)self.fbHeight - 1);
+	return YES;
+}
+
+- (BOOL)directTouchEnabled
+{
+	return [NSUserDefaults.standardUserDefaults integerForKey:kRVVMDefaultsTouchMode] == 1;
+}
+
 - (void)tapPressed:(UITapGestureRecognizer *)gr
 {
-	(void)gr;
+	if ([self directTouchEnabled]) {
+		int32_t x = 0;
+		int32_t y = 0;
+		if ([self guestPointForGesture:gr x:&x y:&y]) {
+			[RV64Runner setVirtioMouseResolutionWidth:(uint32_t)self.fbWidth height:(uint32_t)self.fbHeight];
+			[RV64Runner sendVirtioMouseAbsX:x absY:y];
+			[RV64Runner sendVirtioMouseButtons:1 down:YES];
+			[RV64Runner sendVirtioMouseButtons:1 down:NO];
+		}
+		return;
+	}
 	[RV64Runner sendVirtioMouseButtons:1 down:YES];
 	[RV64Runner sendVirtioMouseButtons:1 down:NO];
 }
 
 - (void)panMoved:(UIPanGestureRecognizer *)gr
 {
+	if ([self directTouchEnabled]) {
+		// One finger drags: press at the touch point, follow it, release on lift.
+		int32_t x = 0;
+		int32_t y = 0;
+		if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
+			if ([self guestPointForGesture:gr x:&x y:&y]) {
+				[RV64Runner setVirtioMouseResolutionWidth:(uint32_t)self.fbWidth height:(uint32_t)self.fbHeight];
+				[RV64Runner sendVirtioMouseAbsX:x absY:y];
+				if (gr.state == UIGestureRecognizerStateBegan && !(self.mouseButtons & 1)) {
+					self.mouseButtons |= 1;
+					[RV64Runner sendVirtioMouseButtons:1 down:YES];
+				}
+			}
+		} else if (self.mouseButtons & 1) {
+			self.mouseButtons &= (uint8_t)~1;
+			[RV64Runner sendVirtioMouseButtons:1 down:NO];
+		}
+		return;
+	}
 	if (gr.state == UIGestureRecognizerStateBegan || gr.state == UIGestureRecognizerStateChanged) {
 		UIView *v = gr.view ?: self.view;
 		CGPoint t = [gr translationInView:v];
@@ -518,6 +586,13 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 @property (nonatomic) BOOL disableIso;
 @property (nonatomic) BOOL virtioFSDebugToUart;
 @property (nonatomic) BOOL autoLoadSnapshot;
+@property (nonatomic) NSInteger gpuMode;
+@property (nonatomic) NSInteger touchMode;
+@property (nonatomic) NSInteger backgroundMode;
+@property (nonatomic) NSInteger importTarget;
+@property (nonatomic, copy) NSString *firmwareName;
+@property (nonatomic, copy) NSArray<NSString *> *extraDisks;
+@property (nonatomic) BOOL sharesEnabled;
 @property (nonatomic, copy) NSString *isoFilename;
 @property (nonatomic, copy) NSString *diskFilename;
 @property (nonatomic, copy) NSArray<NSString *> *portForwards;
@@ -776,6 +851,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	self.autoLoadSnapshot = autoSnapObj ? [d boolForKey:kRVVMDefaultsAutoLoadSnapshot] : YES;
 	self.isoFilename = [d stringForKey:kRVVMDefaultsIsoFilename];
 	self.diskFilename = [d stringForKey:kRVVMDefaultsDiskFilename];
+	self.gpuMode = [d integerForKey:kRVVMDefaultsGPUMode];
+	self.touchMode = [d integerForKey:kRVVMDefaultsTouchMode];
+	self.backgroundMode = [d integerForKey:kRVVMDefaultsBackgroundMode];
+	self.firmwareName = [d stringForKey:kRVVMDefaultsFirmwareFilename];
+	NSArray *extra = [d arrayForKey:kRVVMDefaultsExtraDisks];
+	self.extraDisks = extra ?: @[];
+	// Sharing defaults to on when the key was never set.
+	self.sharesEnabled = [d objectForKey:kRVVMDefaultsSharesEnabled] ? [d boolForKey:kRVVMDefaultsSharesEnabled] : YES;
 	NSArray *pf = [d objectForKey:kRVVMDefaultsPortForwards];
 	if ([pf isKindOfClass:[NSArray class]]) {
 		NSMutableArray<NSString *> *arr = [NSMutableArray array];
@@ -799,6 +882,16 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	[d setBool:self.disableIso forKey:kRVVMDefaultsDisableIso];
 	[d setBool:self.virtioFSDebugToUart forKey:kRVVMDefaultsVirtioFSDebugToUART];
 	[d setBool:self.autoLoadSnapshot forKey:kRVVMDefaultsAutoLoadSnapshot];
+	[d setInteger:self.gpuMode forKey:kRVVMDefaultsGPUMode];
+	[d setInteger:self.touchMode forKey:kRVVMDefaultsTouchMode];
+	[d setInteger:self.backgroundMode forKey:kRVVMDefaultsBackgroundMode];
+	if (self.firmwareName.length > 0) {
+		[d setObject:self.firmwareName forKey:kRVVMDefaultsFirmwareFilename];
+	} else {
+		[d removeObjectForKey:kRVVMDefaultsFirmwareFilename];
+	}
+	[d setObject:(self.extraDisks ?: @[]) forKey:kRVVMDefaultsExtraDisks];
+	[d setBool:self.sharesEnabled forKey:kRVVMDefaultsSharesEnabled];
 	if (self.isoFilename.length > 0) {
 		[d setObject:self.isoFilename forKey:kRVVMDefaultsIsoFilename];
 	} else {
@@ -894,8 +987,8 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	(void)tableView;
 	switch (section) {
 		case 0: return 9;
-		case 1: return 2;
-		case 2: return self.docFiles.count + 2;
+		case 1: return 8;
+		case 2: return self.docFiles.count + 3;
 		case 3: return 3;
 	}
 	return 0;
@@ -1013,12 +1106,39 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	}
 
 	if (indexPath.section == 1) {
-		if (indexPath.row == 0) {
-			cell.textLabel.text = @"Cores";
-			cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld", (long)self.cores];
-		} else {
-			cell.textLabel.text = @"RAM";
-			cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.ramMB];
+		switch (indexPath.row) {
+			case 0:
+				cell.textLabel.text = @"Cores";
+				cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld", (long)self.cores];
+				break;
+			case 1:
+				cell.textLabel.text = @"RAM";
+				cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.ramMB];
+				break;
+			case 2:
+				cell.textLabel.text = @"Graphics";
+				cell.detailTextLabel.text = (self.gpuMode == 1) ? @"virtio-gpu 2D" : @"Simple framebuffer";
+				break;
+			case 3:
+				cell.textLabel.text = @"Touch input";
+				cell.detailTextLabel.text = (self.touchMode == 1) ? @"Direct touch" : @"Trackpad";
+				break;
+			case 4:
+				cell.textLabel.text = @"Background";
+				cell.detailTextLabel.text = [@[@"Off", @"Silent audio", @"Background task"] objectAtIndex:(NSUInteger)MIN(MAX(self.backgroundMode, 0), 2)];
+				break;
+			case 5:
+				cell.textLabel.text = @"Firmware";
+				cell.detailTextLabel.text = self.firmwareName.length > 0 ? self.firmwareName : @"Bundled OpenSBI";
+				break;
+			case 6:
+				cell.textLabel.text = @"Extra disks";
+				cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu attached", (unsigned long)self.extraDisks.count];
+				break;
+			default:
+				cell.textLabel.text = @"Shared folder (virtio-fs)";
+				cell.detailTextLabel.text = self.sharesEnabled ? @"Documents as \"share\"" : @"Off";
+				break;
 		}
 		cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 		cell.accessoryView = nil;
@@ -1068,8 +1188,12 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		cell.textLabel.text = @"Delete all documents";
 		cell.textLabel.textColor = UIColor.systemRedColor;
 		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+	} else if (indexPath.row == 2) {
+		cell.textLabel.text = @"New disk image";
+		cell.textLabel.textColor = UIColor.labelColor;
+		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 	} else {
-		cell.textLabel.text = self.docFiles[indexPath.row - 2];
+		cell.textLabel.text = self.docFiles[indexPath.row - 3];
 		cell.textLabel.textColor = UIColor.labelColor;
 		cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 	}
@@ -1085,16 +1209,130 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	return UITableViewCellEditingStyleNone;
 }
 
+- (void)importFirmwareFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	self.importTarget = 1;
+	UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData] asCopy:YES];
+	picker.delegate = self;
+	picker.allowsMultipleSelection = NO;
+	UIPopoverPresentationController *ppc = picker.popoverPresentationController;
+	if (ppc) {
+		ppc.sourceView = sourceView ?: self.view;
+		ppc.sourceRect = sourceView ? sourceRect : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+		ppc.permittedArrowDirections = UIPopoverArrowDirectionAny;
+	}
+	[self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)importFirmwareFromURL:(NSURL *)url
+{
+	BOOL access = [url startAccessingSecurityScopedResource];
+	NSString *name = nil;
+	NSString *err = nil;
+	BOOL ok = [RV64Runner importFirmwareFromPath:url.path name:&name error:&err];
+	if (access) {
+		[url stopAccessingSecurityScopedResource];
+	}
+	if (!ok) {
+		[self presentSimpleAlertWithTitle:@"Firmware" message:err ?: @"Import failed"];
+		return;
+	}
+	self.firmwareName = name;
+	[self saveDefaults];
+	[self.tableView reloadData];
+}
+
+- (void)presentFirmwareChoiceFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSString *docs = [self documentsDirPath];
+	NSArray<NSString *> *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[docs stringByAppendingPathComponent:@"firmware"] error:nil] ?: @[];
+	NSMutableArray<NSString *> *opts = [NSMutableArray arrayWithObject:@"Bundled OpenSBI"];
+	[opts addObjectsFromArray:files];
+	[opts addObject:@"Import firmware..."];
+	[self presentChoiceWithTitle:@"Firmware" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+		if (idx == 0) {
+			self.firmwareName = nil;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		} else if (idx == (NSInteger)opts.count - 1) {
+			[self importFirmwareFromSourceView:sourceView sourceRect:sourceRect];
+		} else {
+			self.firmwareName = files[(NSUInteger)idx - 1];
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}
+	}];
+}
+
+- (void)presentExtraDisksChoiceFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+	for (NSString *f in self.docFiles) {
+		NSString *ext = f.pathExtension.lowercaseString;
+		if ([ext isEqualToString:@"img"] || [ext isEqualToString:@"raw"] || [ext isEqualToString:@"qcow2"]) {
+			if (![f isEqualToString:self.diskFilename] && ![f isEqualToString:self.isoFilename]) {
+				[candidates addObject:f];
+			}
+		}
+	}
+	NSMutableArray<NSString *> *opts = [NSMutableArray array];
+	for (NSString *f in candidates) {
+		BOOL attached = [self.extraDisks containsObject:f];
+		[opts addObject:[(attached ? @"Detach " : @"Attach ") stringByAppendingString:f]];
+	}
+	[opts addObject:@"Detach all"];
+	[self presentChoiceWithTitle:@"Extra disks" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+		if (idx == (NSInteger)candidates.count) {
+			self.extraDisks = @[];
+		} else {
+			NSString *f = candidates[(NSUInteger)idx];
+			NSMutableArray<NSString *> *arr = [self.extraDisks mutableCopy];
+			if ([arr containsObject:f]) {
+				[arr removeObject:f];
+			} else {
+				[arr addObject:f];
+			}
+			self.extraDisks = arr;
+		}
+		[self saveDefaults];
+		[self.tableView reloadData];
+	}];
+}
+
+- (void)presentNewDiskImageFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSArray<NSNumber *> *sizesGiB = @[@1, @4, @16, @32, @64];
+	NSMutableArray<NSString *> *opts = [NSMutableArray array];
+	for (NSNumber *g in sizesGiB) {
+		[opts addObject:[NSString stringWithFormat:@"%@ GiB (sparse)", g]];
+	}
+	[self presentChoiceWithTitle:@"New disk image" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+		NSString *name = [self uniqueFilenameInDocuments:@"disk.img"];
+		unsigned long long bytes = (unsigned long long)sizesGiB[(NSUInteger)idx].unsignedLongLongValue << 30;
+		NSString *err = nil;
+		if (![RV64Runner createDiskImageNamed:name sizeBytes:bytes error:&err]) {
+			[self presentSimpleAlertWithTitle:@"New disk image" message:err ?: @"Failed"];
+			return;
+		}
+		if (self.diskFilename.length == 0) {
+			self.diskFilename = name;
+		}
+		[self saveDefaults];
+		[self reloadDocFiles];
+		[self.tableView reloadData];
+	}];
+}
+
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath
 {
-	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2 || indexPath.row < 2) {
+	if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 2 || indexPath.row < 3) {
 		return;
 	}
 	NSString *docs = [self documentsDirPath];
 	if (docs.length == 0) {
 		return;
 	}
-	NSString *name = self.docFiles[indexPath.row - 2];
+	NSString *name = self.docFiles[indexPath.row - 3];
 	NSString *path = [docs stringByAppendingPathComponent:name];
 	NSError *err = nil;
 	[[NSFileManager defaultManager] removeItemAtPath:path error:&err];
@@ -1129,6 +1367,91 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		[urls addObject:[NSURL fileURLWithPath:path]];
 	}
 	return urls;
+}
+
+// Per-file actions for a file in Documents. Disk operations refuse while the VM runs (reported by the runner).
+- (void)presentDocumentActionsForName:(NSString *)name sourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSString *lower = name.lowercaseString;
+	BOOL isISO = [lower hasSuffix:@".iso"];
+	BOOL isRawImage = [lower hasSuffix:@".img"] || [lower hasSuffix:@".raw"];
+	BOOL isDisk = isRawImage || [lower hasSuffix:@".qcow2"];
+
+	NSMutableArray<NSString *> *labels = [NSMutableArray array];
+	NSMutableArray<NSString *> *ids = [NSMutableArray array];
+	if (isISO) {
+		[labels addObject:@"Use as ISO"]; [ids addObject:@"iso"];
+	}
+	if (isDisk) {
+		[labels addObject:@"Use as disk image"]; [ids addObject:@"disk"];
+	}
+	if (isRawImage) {
+		[labels addObject:@"Expand disk..."]; [ids addObject:@"expand"];
+		[labels addObject:@"Make sparse (reclaim zeroed space)"]; [ids addObject:@"sparse"];
+	}
+	[labels addObject:@"Export..."]; [ids addObject:@"export"];
+
+	[self presentChoiceWithTitle:name options:labels fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+		NSString *action = ids[(NSUInteger)idx];
+		if ([action isEqualToString:@"iso"]) {
+			self.isoFilename = name;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		} else if ([action isEqualToString:@"disk"]) {
+			self.diskFilename = name;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		} else if ([action isEqualToString:@"expand"]) {
+			[self presentExpandChoiceForName:name sourceView:sourceView sourceRect:sourceRect];
+		} else if ([action isEqualToString:@"sparse"]) {
+			NSString *err = nil;
+			if (![RV64Runner sparsifyDiskImageNamed:name error:&err]) {
+				[self presentSimpleAlertWithTitle:@"Make sparse" message:err ?: @"Failed"];
+			}
+			[self reloadDocFiles];
+			[self.tableView reloadData];
+		} else if ([action isEqualToString:@"export"]) {
+			NSString *docs = [self documentsDirPath];
+			NSURL *url = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:name]];
+			UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+			UIPopoverPresentationController *ppc = avc.popoverPresentationController;
+			if (ppc) {
+				ppc.sourceView = sourceView ?: self.view;
+				ppc.sourceRect = sourceRect;
+			}
+			[self presentViewController:avc animated:YES completion:nil];
+		}
+	}];
+}
+
+// Grow a raw image. Only larger sizes than the current logical size are offered; the runner refuses shrinking.
+- (void)presentExpandChoiceForName:(NSString *)name sourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
+{
+	NSString *path = [[self documentsDirPath] stringByAppendingPathComponent:name];
+	NSNumber *cur = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize];
+	unsigned long long currentBytes = cur.unsignedLongLongValue;
+	NSArray<NSNumber *> *gib = @[@2, @4, @8, @16, @32, @64, @128, @256];
+	NSMutableArray<NSNumber *> *sizes = [NSMutableArray array];
+	NSMutableArray<NSString *> *opts = [NSMutableArray array];
+	for (NSNumber *g in gib) {
+		unsigned long long bytes = (unsigned long long)g.unsignedLongLongValue << 30;
+		if (bytes > currentBytes) {
+			[sizes addObject:@(bytes)];
+			[opts addObject:[NSString stringWithFormat:@"%@ GiB (sparse)", g]];
+		}
+	}
+	if (opts.count == 0) {
+		[self presentSimpleAlertWithTitle:@"Expand disk" message:@"Disk is already larger than the available sizes"];
+		return;
+	}
+	[self presentChoiceWithTitle:@"Expand disk" options:opts fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+		NSString *err = nil;
+		if (![RV64Runner expandDiskImageNamed:name toSizeBytes:sizes[(NSUInteger)idx].unsignedLongLongValue error:&err]) {
+			[self presentSimpleAlertWithTitle:@"Expand disk" message:err ?: @"Failed"];
+		}
+		[self reloadDocFiles];
+		[self.tableView reloadData];
+	}];
 }
 
 - (void)exportDocumentsFromSourceView:(UIView *)sourceView sourceRect:(CGRect)sourceRect
@@ -1260,6 +1583,11 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	if (!url) {
 		return;
 	}
+	if (self.importTarget == 1) {
+		self.importTarget = 0;
+		[self importFirmwareFromURL:url];
+		return;
+	}
 	NSString *ext = url.pathExtension.lowercaseString ?: @"";
 	if (!([ext isEqualToString:@"img"] || [ext isEqualToString:@"raw"] || [ext isEqualToString:@"qcow2"])) {
 		[self presentSimpleAlertWithTitle:@"Import disk" message:@"Unsupported file type. Use .img/.raw/.qcow2"];
@@ -1283,12 +1611,14 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	}
 	NSString *dstPath = [docs stringByAppendingPathComponent:dstName];
 	NSURL *dstURL = [NSURL fileURLWithPath:dstPath];
-	NSError *err = nil;
-	if (![[NSFileManager defaultManager] copyItemAtURL:url toURL:dstURL error:&err]) {
+	(void)dstURL;
+	NSString *importErr = nil;
+	// Imported images are written sparse (holes preserved), so large disks stay small on disk.
+	if (![RV64Runner importDiskImageFromPath:url.path asName:dstName error:&importErr]) {
 		if (access) {
 			[url stopAccessingSecurityScopedResource];
 		}
-		[self presentSimpleAlertWithTitle:@"Import disk" message:@"Copy failed"];
+		[self presentSimpleAlertWithTitle:@"Import disk" message:importErr ?: @"Copy failed"];
 		return;
 	}
 	if (access) {
@@ -1481,8 +1811,52 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 		}];
 		return;
 	}
+	if (indexPath.section == 1 && indexPath.row == 2) {
+		[self presentChoiceWithTitle:@"Graphics" options:@[@"Simple framebuffer", @"virtio-gpu 2D"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.gpuMode = idx;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}];
+		return;
+	}
+	if (indexPath.section == 1 && indexPath.row == 3) {
+		[self presentChoiceWithTitle:@"Touch input" options:@[@"Trackpad", @"Direct touch"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.touchMode = idx;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}];
+		return;
+	}
+	if (indexPath.section == 1 && indexPath.row == 4) {
+		[self presentChoiceWithTitle:@"Background" options:@[@"Off", @"Silent audio (keeps VM running)", @"Background task (about 30 s)"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.backgroundMode = idx;
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}];
+		return;
+	}
+	if (indexPath.section == 1 && indexPath.row == 5) {
+		[self presentFirmwareChoiceFromSourceView:sourceView sourceRect:sourceRect];
+		return;
+	}
+	if (indexPath.section == 1 && indexPath.row == 6) {
+		[self presentExtraDisksChoiceFromSourceView:sourceView sourceRect:sourceRect];
+		return;
+	}
+	if (indexPath.section == 1 && indexPath.row == 7) {
+		[self presentChoiceWithTitle:@"Shared folder" options:@[@"Off", @"Share Documents (virtio-fs tag \"share\")"] fromSourceView:sourceView sourceRect:sourceRect handler:^(NSInteger idx) {
+			self.sharesEnabled = (idx == 1);
+			[self saveDefaults];
+			[self.tableView reloadData];
+		}];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row == 2) {
+		[self presentNewDiskImageFromSourceView:sourceView sourceRect:sourceRect];
+		return;
+	}
 	if (indexPath.section == 1 && indexPath.row == 1) {
-		NSArray<NSNumber *> *vals = @[@256, @512, @768, @1024, @1536, @2048];
+		NSArray<NSNumber *> *vals = @[@256, @512, @768, @1024, @1536, @2048, @3072, @4096, @6144, @8192];
 		NSMutableArray<NSString *> *opts = [NSMutableArray array];
 		for (NSNumber *n in vals) {
 			[opts addObject:[NSString stringWithFormat:@"%@ MB", n]];
@@ -1497,6 +1871,10 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	if (indexPath.section == 3 && indexPath.row == 2) {
 		RV64VirtioFSDebugViewController *vc = [RV64VirtioFSDebugViewController new];
 		[self.navigationController pushViewController:vc animated:YES];
+		return;
+	}
+	if (indexPath.section == 2 && indexPath.row >= 3) {
+		[self presentDocumentActionsForName:self.docFiles[indexPath.row - 3] sourceView:sourceView sourceRect:sourceRect];
 		return;
 	}
 	if (indexPath.section == 2 && indexPath.row == 0) {

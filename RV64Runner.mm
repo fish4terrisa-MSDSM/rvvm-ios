@@ -5,25 +5,21 @@
 #import <dispatch/dispatch.h>
 
 #include <rvvm/rvvm.h>
+#include <rvvm/rvvm_blk.h>
+#include <rvvm/rvvm_board.h>
 #include <rvvm/rvvm_fb.h>
+#include <rvvm/rvvm_pci.h>
 
 extern "C" {
-#include "devices/bochs-display.h"
 #include "devices/chardev.h"
-#include "devices/eth-oc.h"
 #include "devices/framebuffer.h"
 #include "devices/hid_api.h"
 #include "devices/i2c-oc.h"
-#include "devices/nvme.h"
 #include "devices/ns16550a.h"
-#include "devices/pci-bus.h"
-#include "devices/riscv-aclint.h"
-#include "devices/riscv-plic.h"
 #include "devices/rtl8169.h"
 #include "devices/tap_api.h"
-#include "devices/rtc-goldfish.h"
-#include "devices/syscon.h"
 #include "devices/virtio-fs.h"
+#include "devices/virtio-gpu.h"
 }
 
 #include <algorithm>
@@ -66,6 +62,13 @@ static NSString *const kRVVMDefaultsArchImgFilename = @"rvvm.archImgFilename";
 static NSString *const kRVVMDefaultsPortForwards = @"rvvm.portForwards";
 static NSString *const kRVVMDefaultsVirtioFSDebugToUART = @"rvvm.virtiofsDebugToUart";
 static NSString *const kRVVMDefaultsAutoLoadSnapshot = @"rvvm.autoLoadSnapshot";
+static NSString *const kRVVMDefaultsExtraDisks = @"rvvm.extraDisks";
+static NSString *const kRVVMDefaultsShares = @"rvvm.shares";
+static NSString *const kRVVMDefaultsFirmwareFilename = @"rvvm.firmwareFilename";
+static NSString *const kRVVMDefaultsGPUMode = @"rvvm.gpuMode";
+
+// Framebuffer VRAM shared by bochs-display, simplefb and virtio-gpu (covers 4K XRGB).
+static const size_t kIOSFramebufferVRAMBytes = (size_t)32 << 20;
 
 typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeAuto = 0,
@@ -74,8 +77,46 @@ typedef NS_ENUM(NSInteger, RVVMBootMode) {
 	RVVMBootModeCustom = 3,
 };
 
+// Console log in Documents/logs/console.log (visible in the Files app). Rotates at 4 MB to console.log.1.
+// Writes happen on a serial queue so the VM threads never block on disk.
+static void AppendConsoleLog(const std::string& s)
+{
+	if (s.empty()) {
+		return;
+	}
+	static dispatch_queue_t logQueue = dispatch_queue_create("com.adih.rvvm.log", DISPATCH_QUEUE_SERIAL);
+	NSData *data = [NSData dataWithBytes:s.data() length:s.size()];
+	dispatch_async(logQueue, ^{
+		NSFileManager *fm = NSFileManager.defaultManager;
+		NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+		if (!docs) {
+			return;
+		}
+		NSString *dir = [docs stringByAppendingPathComponent:@"logs"];
+		[fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+		NSString *path = [dir stringByAppendingPathComponent:@"console.log"];
+		NSNumber *size = [fm attributesOfItemAtPath:path error:nil][NSFileSize];
+		if (size.unsignedLongLongValue > (4ULL << 20)) {
+			NSString *old = [path stringByAppendingString:@".1"];
+			[fm removeItemAtPath:old error:nil];
+			[fm moveItemAtPath:path toPath:old error:nil];
+		}
+		if (![fm fileExistsAtPath:path]) {
+			[fm createFileAtPath:path contents:nil attributes:nil];
+		}
+		NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+		if (!fh) {
+			return;
+		}
+		[fh seekToEndOfFileWithError:nil];
+		[fh writeData:data error:nil];
+		[fh closeAndReturnError:nil];
+	});
+}
+
 static void PostUARTText(const std::string& s)
 {
+	AppendConsoleLog(s);
 	CFStringRef cfText = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8 *)s.data(), (CFIndex)s.size(),
 	                                            kCFStringEncodingUTF8, false);
 	NSString *text = cfText ? (__bridge_transfer NSString *)cfText : nil;
@@ -89,6 +130,7 @@ static void PostUARTText(const std::string& s)
 
 static void PostVirtioFSDebugText(const std::string& s)
 {
+	AppendConsoleLog(s);
 	CFStringRef cfText = CFStringCreateWithBytes(kCFAllocatorDefault, (const UInt8 *)s.data(), (CFIndex)s.size(),
 	                                            kCFStringEncodingUTF8, false);
 	NSString *text = cfText ? (__bridge_transfer NSString *)cfText : nil;
@@ -609,6 +651,15 @@ static std::string SnapshotFilePathUTF8()
 	}
 }
 
+static std::string SnapshotMetaPathUTF8()
+{
+	std::string snap = SnapshotFilePathUTF8();
+	if (snap.empty()) {
+		return {};
+	}
+	return snap.substr(0, snap.size() - strlen("rvvm.snapshot.img")) + "rvvm.snapshot.meta";
+}
+
 struct RvvmSnapshotHeader
 {
 	char magic[8];
@@ -644,6 +695,164 @@ static bool ReadRvvmSnapshotHeader(const std::string& path, RvvmSnapshotHeader* 
 	}
 	return true;
 }
+
+static bool WriteRvvmSnapshotHeader(const std::string& path, const RvvmSnapshotHeader& hdr)
+{
+	int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		return false;
+	}
+	ssize_t n = write(fd, &hdr, sizeof(hdr));
+	close(fd);
+	return n == (ssize_t)sizeof(hdr);
+}
+
+// Upstream snapshots are block-device based: the machine state is streamed into snapPath.
+static bool SaveMachineSnapshot(rvvm_machine_t* machine, const std::string& snapPath)
+{
+	rvvm_blk_dev_t* blk = rvvm_blk_open(snapPath.c_str(), NULL, RVVM_BLK_RW | RVVM_BLK_CREAT | RVVM_BLK_TRUNC);
+	if (!blk) {
+		return false;
+	}
+	bool ok = rvvm_machine_snapshot(machine, blk, true);
+	rvvm_blk_close(blk);
+	return ok;
+}
+
+static bool LoadMachineSnapshot(rvvm_machine_t* machine, const std::string& snapPath)
+{
+	rvvm_blk_dev_t* blk = rvvm_blk_open(snapPath.c_str(), NULL, RVVM_BLK_READ);
+	if (!blk) {
+		return false;
+	}
+	bool ok = rvvm_machine_snapshot(machine, blk, false);
+	rvvm_blk_close(blk);
+	return ok;
+}
+
+// Attach a raw image as an NVMe disk. Read-only images are opened without write access.
+static bool AttachNVMeDisk(rvvm_machine_t* machine, const std::string& path, bool readOnly)
+{
+	uint32_t opts = readOnly ? RVVM_BLK_READ : RVVM_BLK_RW;
+	rvvm_blk_dev_t* blk = rvvm_blk_open(path.c_str(), NULL, opts);
+	if (!blk) {
+		return false;
+	}
+	return rvvm_nvme_init(machine, blk, RVVM_PCI_ADDR_ANY) != NULL;
+}
+
+// ---- Sparse raw images -----------------------------------------------------
+// RVVM only supports raw images. Images are created and copied with holes so
+// that a 64 GiB disk only occupies the blocks that were actually written.
+
+static bool SetErrorString(NSString * _Nullable * _Nullable errorOut, NSString *msg)
+{
+	if (errorOut) {
+		*errorOut = msg;
+	}
+	return NO;
+}
+
+static const size_t kSparseChunk = (size_t)1 << 20;
+
+// Copy src to dst, skipping all-zero chunks so the destination stays sparse.
+static bool SparseCopyFile(const std::string& src, const std::string& dst, uint64_t* sizeOut)
+{
+	int in = open(src.c_str(), O_RDONLY);
+	if (in < 0) {
+		return false;
+	}
+	struct stat st;
+	if (fstat(in, &st) != 0) {
+		close(in);
+		return false;
+	}
+	int out = open(dst.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out < 0) {
+		close(in);
+		return false;
+	}
+	std::vector<uint8_t> buf(kSparseChunk);
+	bool ok = true;
+	off_t off = 0;
+	while (off < st.st_size) {
+		size_t want = (size_t)std::min<off_t>((off_t)kSparseChunk, st.st_size - off);
+		ssize_t got = pread(in, buf.data(), want, off);
+		if (got <= 0) {
+			ok = (got == 0);
+			break;
+		}
+		bool zero = true;
+		for (ssize_t i = 0; i < got && zero; i++) {
+			zero = (buf[(size_t)i] == 0);
+		}
+		if (!zero) {
+			ssize_t put = pwrite(out, buf.data(), (size_t)got, off);
+			if (put != got) {
+				ok = false;
+				break;
+			}
+		}
+		off += got;
+	}
+	if (ok && ftruncate(out, st.st_size) != 0) {
+		ok = false;
+	}
+	close(in);
+	close(out);
+	if (ok && sizeOut) {
+		*sizeOut = (uint64_t)st.st_size;
+	}
+	return ok;
+}
+
+static bool CreateSparseImage(const std::string& path, uint64_t size)
+{
+	int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+	if (fd < 0) {
+		return false;
+	}
+	bool ok = (ftruncate(fd, (off_t)size) == 0);
+	close(fd);
+	return ok;
+}
+
+static bool ExpandSparseImage(const std::string& path, uint64_t newSize)
+{
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0 || (uint64_t)st.st_size > newSize) {
+		return false;   // RVVM images cannot shrink safely; growing only
+	}
+	int fd = open(path.c_str(), O_RDWR);
+	if (fd < 0) {
+		return false;
+	}
+	bool ok = (ftruncate(fd, (off_t)newSize) == 0);
+	close(fd);
+	return ok;
+}
+
+// Rewrite an existing raw image so all-zero regions become holes.
+static bool SparsifyImage(const std::string& path)
+{
+	std::string tmp = path + ".sparse-tmp";
+	uint64_t size = 0;
+	if (!SparseCopyFile(path, tmp, &size)) {
+		unlink(tmp.c_str());
+		return false;
+	}
+	if (rename(tmp.c_str(), path.c_str()) != 0) {
+		unlink(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+
+#if defined(USE_FPU)
+#define USE_FPU_FLAG 1
+#else
+#define USE_FPU_FLAG 0
+#endif
 
 static bool RunLinuxOnce()
 {
@@ -704,9 +913,10 @@ static bool RunLinuxOnce()
 		NSURL *archImgURL = [bundle URLForResource:@"archriscv-2026-01-07-4g" withExtension:@"img" subdirectory:@"rv64linux"];
 
 		std::string snapPath = SnapshotFilePathUTF8();
+		std::string snapMetaPath = SnapshotMetaPathUTF8();
 		RvvmSnapshotHeader snapHdr = {};
-		bool haveSnapHeader = (!snapPath.empty() && ReadRvvmSnapshotHeader(snapPath, &snapHdr));
-		bool haveSnap = haveSnapHeader && autoLoadSnapshot;
+		bool haveSnapHeader = (!snapMetaPath.empty() && ReadRvvmSnapshotHeader(snapMetaPath, &snapHdr));
+		bool haveSnap = haveSnapHeader && autoLoadSnapshot && PathExists(snapPath);
 
 		std::string isoPath;
 		if (!disableIso) {
@@ -764,6 +974,15 @@ static bool RunLinuxOnce()
 		}
 
 		std::string biosPath = FileSystemPath(biosURL);
+		NSString *fwName = [defaults stringForKey:kRVVMDefaultsFirmwareFilename];
+		if (fwName.length > 0) {
+			std::string userFw = DocsFilePathIfExists([@"firmware/" stringByAppendingString:fwName]);
+			if (!userFw.empty()) {
+				biosPath = userFw;
+			} else {
+				PostUARTText("rvvm: selected firmware missing, using bundled OpenSBI\n");
+			}
+		}
 		std::string imagePath;
 		std::string installDiskPath;
 		if (useArchImage) {
@@ -878,6 +1097,10 @@ static bool RunLinuxOnce()
 			preferredMem = useIso ? (size_t)(1ULL << 30) : (useArchImage ? (size_t)(2ULL << 30) : (size_t)(256ULL << 20));
 		}
 		static const size_t fallbacks[] = {
+			(size_t)(8ULL << 30),
+			(size_t)(6ULL << 30),
+			(size_t)(4ULL << 30),
+			(size_t)(3ULL << 30),
 			(size_t)(2ULL << 30),
 			(size_t)(1536ULL << 20),
 			(size_t)(1024ULL << 20),
@@ -920,7 +1143,6 @@ static bool RunLinuxOnce()
 			PostUARTText("rvvm: rvvm_create_machine failed (RAM allocation)\n");
 			return false;
 		}
-		rvvm_set_opt(machine, RVVM_OPT_JIT, 0);
 		rvvm_append_cmdline(machine, " console=ttyS0,115200 console=tty0 earlycon=sbi");
 
 		chardev_t* chardev = CreateUIKitChardev();
@@ -930,18 +1152,16 @@ static bool RunLinuxOnce()
 			return false;
 		}
 
-		riscv_clint_init_auto(machine);
-		riscv_plic_init_auto(machine);
-		tap_dev_t* tap = nullptr;
-		hid_keyboard_t* kbVirtio = hid_keyboard_init_auto_virtio(machine);
-		hid_mouse_t* mouseVirtio = hid_mouse_init_auto_virtio(machine);
-		pci_bus_t* pci = pci_bus_init_auto(machine);
-		if (!pci) {
-			PostUARTText("rvvm: pci bus failed\n");
+		// CLINT, PLIC, PCIe ECAM, syscon and goldfish RTC
+		if (!rvvm_board_riscv_virt_init(machine, false)) {
+			PostUARTText("rvvm: board init failed\n");
 			chardev_free(chardev);
 			rvvm_free_machine(machine);
 			return false;
 		}
+		tap_dev_t* tap = nullptr;
+		hid_keyboard_t* kbVirtio = hid_keyboard_init_auto_virtio(machine);
+		hid_mouse_t* mouseVirtio = hid_mouse_init_auto_virtio(machine);
 
 		rvvm_fbdev_t* fbdev = rvvm_fbdev_init();
 		if (!fbdev) {
@@ -952,7 +1172,7 @@ static bool RunLinuxOnce()
 		}
 		rvvm_fbdev_inc_ref(fbdev);
 		std::vector<uint8_t> vram;
-		vram.resize((size_t)RVVM_BOCHS_DISPLAY_VRAM);
+		vram.resize(kIOSFramebufferVRAMBytes);
 		memset(vram.data(), 0, vram.size());
 		(void)rvvm_fbdev_set_vram(fbdev, vram.data(), vram.size());
 		{
@@ -965,8 +1185,19 @@ static bool RunLinuxOnce()
 			rvvm_fbdev_set_scanout(fbdev, &bootFb);
 		}
 		rvvm_fbdev_register_display(fbdev, &s_ios_display_cb);
-		(void)rvvm_simplefb_init_auto(machine, fbdev);
-		(void)rvvm_bochs_display_init(pci, fbdev);
+		// gpuMode 1 = virtio-gpu 2D (3D backends are not built into this app yet).
+		// Otherwise fall back to the simple framebuffer and bochs display.
+		NSInteger gpuMode = [defaults integerForKey:kRVVMDefaultsGPUMode];
+		if (gpuMode == 1) {
+			if (!virtio_gpu_init_auto(machine, fbdev, 1280, 720)) {
+				PostUARTText("rvvm: virtio-gpu init failed, using simplefb\n");
+				(void)rvvm_simplefb_init_auto(machine, fbdev);
+				(void)rvvm_bochs_display_init_auto(machine, fbdev);
+			}
+		} else {
+			(void)rvvm_simplefb_init_auto(machine, fbdev);
+			(void)rvvm_bochs_display_init_auto(machine, fbdev);
+		}
 		(void)i2c_oc_init_auto(machine);
 
 		tap = tap_open();
@@ -977,7 +1208,7 @@ static bool RunLinuxOnce()
 			(void)rvvm_fbdev_dec_ref(fbdev);
 			return false;
 		}
-		if (!rtl8169_init(pci, tap)) {
+		if (!rvvm_rtl8169_init(machine, tap, RVVM_PCI_ADDR_ANY)) {
 			PostUARTText("rvvm: rtl8169 failed\n");
 			tap_close(tap);
 			chardev_free(chardev);
@@ -1000,7 +1231,7 @@ static bool RunLinuxOnce()
 			}
 		}
 		if (useArchImage) {
-			if (!nvme_init_auto(machine, imagePath.c_str(), true)) {
+			if (!AttachNVMeDisk(machine, imagePath, false)) {
 				PostUARTText("rvvm: nvme failed\n");
 				if (tap) {
 					tap_close(tap);
@@ -1012,7 +1243,7 @@ static bool RunLinuxOnce()
 			}
 		}
 		if (useIso) {
-			if (!nvme_init_auto(machine, isoPath.c_str(), false)) {
+			if (!AttachNVMeDisk(machine, isoPath, true)) {
 				PostUARTText("rvvm: nvme iso failed\n");
 				if (tap) {
 					tap_close(tap);
@@ -1022,7 +1253,7 @@ static bool RunLinuxOnce()
 				(void)rvvm_fbdev_dec_ref(fbdev);
 				return false;
 			}
-			if (!nvme_init_auto(machine, installDiskPath.c_str(), true)) {
+			if (!AttachNVMeDisk(machine, installDiskPath, false)) {
 				PostUARTText("rvvm: nvme disk failed\n");
 				if (tap) {
 					tap_close(tap);
@@ -1033,10 +1264,40 @@ static bool RunLinuxOnce()
 				return false;
 			}
 		}
-		syscon_init_auto(machine);
-		rtc_goldfish_init_auto(machine);
+		NSArray<NSString *> *extraDisks = [defaults arrayForKey:kRVVMDefaultsExtraDisks];
+		for (NSString *name in extraDisks) {
+			std::string extraPath = DocsFilePathIfExists(name);
+			if (extraPath.empty() || extraPath == imagePath || extraPath == installDiskPath || extraPath == isoPath) {
+				continue;
+			}
+			if (!AttachNVMeDisk(machine, extraPath, false)) {
+				PostUARTText(("rvvm: extra disk failed: " + extraPath + "\n").c_str());
+			}
+		}
+
 		ns16550a_init_auto(machine, chardev);
-		if (!docsPathUTF8.empty()) {
+
+		// Shared folders: each entry is a directory under Documents, mounted by its name.
+		// Without entries, the whole Documents folder is shared as "share".
+		NSArray<NSString *> *shares = [defaults arrayForKey:kRVVMDefaultsShares];
+		BOOL sharesOn = [defaults objectForKey:@"rvvm.sharesEnabled"] ? [defaults boolForKey:@"rvvm.sharesEnabled"] : YES;
+		if (!sharesOn) {
+			// Sharing turned off in settings: no virtio-fs device is attached.
+		} else if (shares.count > 0) {
+			for (NSString *rel in shares) {
+				std::string dir = DocsFilePathIfExists(rel);
+				if (dir.empty()) {
+					continue;
+				}
+				std::string tag = UTF8FromNSString([rel lastPathComponent]);
+				if (tag.empty()) {
+					continue;
+				}
+				if (!virtio_fs_init_auto(machine, tag.c_str(), dir.c_str())) {
+					PostVirtioFSDebugText("rvvm: virtio-fs share failed: " + dir);
+				}
+			}
+		} else if (!docsPathUTF8.empty()) {
 			(void)virtio_fs_init_auto(machine, "share", docsPathUTF8.c_str());
 		}
 
@@ -1061,7 +1322,9 @@ static bool RunLinuxOnce()
 				if ((snapHdr.flags & 0x1) == expectedFlags &&
 				    snapHdr.mem_size == (uint64_t)chosenMem &&
 				    snapHdr.hart_count == (uint32_t)smp) {
-					(void)rvvm_load_snapshot(machine, snapPath.c_str());
+					if (!LoadMachineSnapshot(machine, snapPath)) {
+						PostUARTText("rvvm: snapshot restore failed, booting fresh\n");
+					}
 				}
 			}
 		}
@@ -1094,7 +1357,14 @@ static bool RunLinuxOnce()
 					rvvm_start_machine(machine);
 					continue;
 				}
-				if (!rvvm_save_snapshot(machine, snapPath.c_str())) {
+				RvvmSnapshotHeader meta = {};
+				memcpy(meta.magic, "RVVMSNAP", 8);
+				meta.version = 1;
+				meta.flags = (uint32_t)USE_FPU_FLAG;
+				meta.mem_addr = 0x80000000ULL;
+				meta.mem_size = (uint64_t)chosenMem;
+				meta.hart_count = (uint32_t)smp;
+				if (!SaveMachineSnapshot(machine, snapPath) || !WriteRvvmSnapshotHeader(SnapshotMetaPathUTF8(), meta)) {
 					SetSnapshotResult(false, "snapshot save failed");
 					rvvm_start_machine(machine);
 					continue;
@@ -1115,7 +1385,7 @@ static bool RunLinuxOnce()
 					rvvm_start_machine(machine);
 					continue;
 				}
-				if (!rvvm_load_snapshot(machine, snapPath.c_str())) {
+				if (!LoadMachineSnapshot(machine, snapPath)) {
 					SetSnapshotResult(false, "snapshot load failed");
 					rvvm_start_machine(machine);
 					continue;
@@ -1172,6 +1442,123 @@ static bool RunLinuxOnce()
 }
 
 @implementation RV64Runner
+
+static NSString *DocumentsDirectory(void)
+{
+	NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+	return dirs.count > 0 ? dirs[0] : nil;
+}
+
+static BOOL IsVMRunning(void)
+{
+	std::lock_guard<std::mutex> lock(s_state_mutex);
+	return s_machine != nullptr;
+}
+
+static BOOL ValidImageName(NSString *name)
+{
+	return name.length > 0 && ![name containsString:@"/"] && ![name hasPrefix:@"."];
+}
+
+static std::string DocumentsPathFor(NSString *name)
+{
+	NSString *dir = DocumentsDirectory();
+	if (!dir || !ValidImageName(name)) {
+		return {};
+	}
+	return UTF8FromNSString([dir stringByAppendingPathComponent:name]);
+}
+
++ (BOOL)createDiskImageNamed:(NSString *)name
+                   sizeBytes:(unsigned long long)sizeBytes
+                       error:(NSString * _Nullable * _Nullable)errorOut
+{
+	if (IsVMRunning()) {
+		return SetErrorString(errorOut, @"Stop the VM before changing disk images");
+	}
+	std::string path = DocumentsPathFor(name);
+	if (path.empty() || sizeBytes == 0) {
+		return SetErrorString(errorOut, @"Invalid image name or size");
+	}
+	if (!CreateSparseImage(path, (uint64_t)sizeBytes)) {
+		return SetErrorString(errorOut, @"Could not create image (name in use or no space)");
+	}
+	return YES;
+}
+
++ (BOOL)expandDiskImageNamed:(NSString *)name
+                 toSizeBytes:(unsigned long long)sizeBytes
+                       error:(NSString * _Nullable * _Nullable)errorOut
+{
+	if (IsVMRunning()) {
+		return SetErrorString(errorOut, @"Stop the VM before changing disk images");
+	}
+	std::string path = DocumentsPathFor(name);
+	if (path.empty()) {
+		return SetErrorString(errorOut, @"Invalid image name");
+	}
+	if (!ExpandSparseImage(path, (uint64_t)sizeBytes)) {
+		return SetErrorString(errorOut, @"Image can only grow, and the size must be larger than the current one");
+	}
+	return YES;
+}
+
++ (BOOL)sparsifyDiskImageNamed:(NSString *)name
+                         error:(NSString * _Nullable * _Nullable)errorOut
+{
+	if (IsVMRunning()) {
+		return SetErrorString(errorOut, @"Stop the VM before changing disk images");
+	}
+	std::string path = DocumentsPathFor(name);
+	if (path.empty() || !SparsifyImage(path)) {
+		return SetErrorString(errorOut, @"Could not make image sparse");
+	}
+	return YES;
+}
+
++ (BOOL)importDiskImageFromPath:(NSString *)sourcePath
+                         asName:(NSString *)name
+                          error:(NSString * _Nullable * _Nullable)errorOut
+{
+	if (IsVMRunning()) {
+		return SetErrorString(errorOut, @"Stop the VM before importing disk images");
+	}
+	std::string src = UTF8FromNSString(sourcePath);
+	std::string dst = DocumentsPathFor(name);
+	if (src.empty() || dst.empty()) {
+		return SetErrorString(errorOut, @"Invalid import path");
+	}
+	// Copy with holes preserved, so imported images stay sparse on disk.
+	uint64_t size = 0;
+	if (!SparseCopyFile(src, dst, &size)) {
+		unlink(dst.c_str());
+		return SetErrorString(errorOut, @"Import failed");
+	}
+	return YES;
+}
+
++ (BOOL)importFirmwareFromPath:(NSString *)sourcePath
+                          name:(NSString * _Nullable * _Nullable)nameOut
+                         error:(NSString * _Nullable * _Nullable)errorOut
+{
+	NSString *docs = DocumentsDirectory();
+	if (!docs) {
+		return SetErrorString(errorOut, @"Documents folder unavailable");
+	}
+	NSString *dirPath = [docs stringByAppendingPathComponent:@"firmware"];
+	[[NSFileManager defaultManager] createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:nil];
+	NSString *name = [sourcePath lastPathComponent];
+	std::string src = UTF8FromNSString(sourcePath);
+	std::string dst = UTF8FromNSString([dirPath stringByAppendingPathComponent:name]);
+	uint64_t size = 0;
+	if (src.empty() || dst.empty() || !SparseCopyFile(src, dst, &size)) {
+		return SetErrorString(errorOut, @"Firmware import failed");
+	}
+	if (nameOut) {
+		*nameOut = name;
+	}
+	return YES;
+}
 
 + (void)startLinux
 {
@@ -1262,6 +1649,11 @@ static bool RunLinuxOnce()
 	if (machine) {
 		rvvm_pause_machine(machine);
 	}
+}
+
++ (BOOL)isRunning
+{
+	return IsVMRunning();
 }
 
 + (void)reinitNetwork

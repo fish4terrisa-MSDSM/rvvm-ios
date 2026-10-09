@@ -13,3 +13,6 @@ DerivedData/
 
 .DS_Store
 Thumbs.db
+
+# Upstream RVVM checkout, managed by scripts/prepare-rvvm.sh (not a submodule).
+RVVM/

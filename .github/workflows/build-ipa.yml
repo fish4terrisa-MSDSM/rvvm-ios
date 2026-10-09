@@ -1,0 +1,44 @@
+name: Build IPA
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Merged pull requests only; manual runs always build.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install ldid and Theos
+        run: |
+          brew install ldid
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos-sdks"
+          cp -R "$HOME/theos-sdks/"*.sdk "$HOME/theos/sdks/"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Build IPA
+        # `make ipa` runs prepare-rvvm.sh (fetches upstream RVVM at the pinned commit and
+        # applies patches/*.patch), fetches xterm assets, builds, and packages to packages/.
+        run: make ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvvm-ipa
+          path: packages/*.ipa
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,72 @@
+From 64595e42f46c35688067935ed3ef9ff21658614a Mon Sep 17 00:00:00 2001
+From: rvvm-ios port <port@rvvm-ios.local>
+Date: Fri, 9 Oct 2026 06:59:01 +0000
+Subject: [PATCH 5/5] main: -virtiofs tag=path and -virtiogpu 2d CLI options
+
+---
+ src/main.c | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/src/main.c b/src/main.c
+index f96be95..6dad875 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -41,6 +41,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ #include <devices/sound-hda.h>
+ 
+ #include <devices/tap_api.h>
++#include <devices/virtio-fs.h>
++#include <devices/virtio-gpu.h>
++
++#include <string.h>
+ 
+ #include <gui/gui_window.h>
+ 
+@@ -192,6 +196,8 @@ static void rvvm_print_help(void)
+         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
+         "    -nogui           Disable display GUI\n"
+         "    -nogpu           Disable GPU\n"
++        "    -virtiofs tag=path  Share a host directory via virtio-fs (mount tag: tag)\n"
++        "    -virtiogpu 2d    Attach virtio-gpu in 2D mode (3D needs a backend)\n"
+         "    -nosound         Disable sound support\n"
+         "    -nonet           Disable networking\n"
+         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
+@@ -244,6 +250,35 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
+                     rvvm_error("Failed to attach image \"%s\"", arg_val);
+                     return false;
+                 }
++            } else if (rvvm_strcmp(arg_name, "virtiofs")) {
++                // Format: tag=/host/path
++                const char* eq = strchr(arg_val, '=');
++                if (!eq || eq == arg_val || !eq[1]) {
++                    rvvm_error("Invalid virtio-fs spec \"%s\", expected tag=path", arg_val);
++                    return false;
++                }
++                char tag[64];
++                size_t tag_len = (size_t)(eq - arg_val);
++                if (tag_len >= sizeof(tag)) {
++                    rvvm_error("virtio-fs tag too long");
++                    return false;
++                }
++                memcpy(tag, arg_val, tag_len);
++                tag[tag_len] = 0;
++                if (!virtio_fs_init_auto(machine, tag, eq + 1)) {
++                    rvvm_error("Failed to attach virtio-fs share \"%s\"", arg_val);
++                    return false;
++                }
++            } else if (rvvm_strcmp(arg_name, "virtiogpu")) {
++                if (!rvvm_strcmp(arg_val, "2d")) {
++                    rvvm_error("Unknown virtio-gpu mode \"%s\", only 2d is available from the CLI", arg_val);
++                    return false;
++                }
++                rvvm_fbdev_t* gpu_fb = rvvm_fbdev_init();
++                if (!gpu_fb || !virtio_gpu_init_auto(machine, gpu_fb, 1280, 800)) {
++                    rvvm_error("Failed to attach virtio-gpu");
++                    return false;
++                }
+             } else if (rvvm_strcmp(arg_name, "serial")) {
+                 chardev_t* chardev = chardev_pty_create(arg_val);
+                 if (chardev == NULL && !rvvm_strcmp(arg_val, "null")) {
+-- 
+2.39.5
+
