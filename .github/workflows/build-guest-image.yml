@@ -1,0 +1,78 @@
+name: Build guest test image
+
+# Builds the riscv64 Linux test image used to exercise rvvm-ios GPU backends:
+#   * Linux kernel (riscv64, all RVVM virtio drivers built-in, virtio-gpu blob)
+#   * Debian sid riscv64 rootfs with Mesa venus + zink + softpipe, glmark2, vkmark
+#
+# Output artifacts (download with `gh run download`):
+#   guest-kernel/Image
+#   guest-disk/disk.raw        (sparse raw ext4 disk; import in rvvm-ios)
+#   guest-disk/SHA256SUMS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "Linux kernel git tag to build (torvalds/linux)"
+        required: false
+        default: "v6.12"
+      disk_size:
+        description: "Guest disk image size"
+        required: false
+        default: "8G"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+            flex bison bc libssl-dev libelf-dev kmod cpio \
+            debootstrap qemu-user-static binfmt-support \
+            e2fsprogs rsync debian-archive-keyring
+
+      - name: Cache kernel build
+        uses: actions/cache@v4
+        with:
+          path: work/linux
+          key: guest-kernel-${{ inputs.kernel_tag }}-${{ hashFiles('scripts/guest-kernel.config') }}
+
+      - name: Build kernel
+        run: |
+          chmod +x scripts/*.sh
+          scripts/build-guest-kernel.sh work "${{ inputs.kernel_tag }}"
+
+      - name: Build rootfs + disk image
+        run: |
+          scripts/build-guest-image.sh work work/disk.raw "${{ inputs.disk_size }}"
+
+      - name: Package artifacts
+        run: |
+          mkdir -p out/kernel out/disk
+          cp work/Image out/kernel/Image
+          cp work/kernel-config-report.txt out/kernel/
+          tar --sparse -C work -cf out/disk/disk.tar disk.raw
+          gzip -1 out/disk/disk.tar
+          (cd out && sha256sum kernel/Image disk/disk.tar.gz > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-kernel
+          path: out/kernel
+          retention-days: 30
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-disk
+          path: out/disk
+          retention-days: 30
