@@ -1,0 +1,234 @@
+From b8aafe7a9d7baf382a30d93c8a0a4df3aba5407c Mon Sep 17 00:00:00 2001
+From: rvvm-ios <rvvm-ios@local>
+Date: Fri, 9 Oct 2026 08:37:16 +0000
+Subject: [PATCH] blk_io: sparse raw image tooling (create, resize, sparsify)
+---
+ include/rvvm/rvvm_blk.h |  38 ++++++++++++++
+ src/core/rvvm_blk.c     | 109 ++++++++++++++++++++++++++++++++++++++++
+ src/main.c              |  47 +++++++++++++++++
+ 3 files changed, 194 insertions(+)
+
+diff --git a/include/rvvm/rvvm_blk.h b/include/rvvm/rvvm_blk.h
+index 85900b1..8e0a563 100644
+--- a/include/rvvm/rvvm_blk.h
++++ b/include/rvvm/rvvm_blk.h
+@@ -96,6 +96,44 @@ RVVM_PUBLIC bool rvvm_blk_trim(rvvm_blk_dev_t* blk, uint64_t off, uint64_t size)
+  */
+ RVVM_PUBLIC bool rvvm_blk_seek_head(rvvm_blk_dev_t* blk, int64_t off, uint32_t whence);
+ 
++/**
++ * \file rvvm_blk.h Image file tooling (raw images)
++ *
++ * Utilities for managing raw disk images backed by sparse files.
++ * Newly created images are sparse (no storage is allocated until written),
++ * and sparsify reclaims zero-filled regions of imported images.
++ */
++
++/**
++ * Create a sparse raw image file of the given size.
++ * If the file already exists and is smaller, it is expanded (never truncated).
++ * @param path Path to the image file.
++ * @param size Desired virtual size in bytes.
++ * @return true on success.
++ */
++RVVM_PUBLIC bool rvvm_blk_image_create(const char* path, uint64_t size);
++
++/**
++ * Resize an existing raw image. Growing is always sparse-aware;
++ * shrinking truncates the file (data past the new size is lost).
++ * @param path Path to the image file.
++ * @param size New virtual size in bytes.
++ * @return true on success.
++ */
++RVVM_PUBLIC bool rvvm_blk_image_resize(const char* path, uint64_t size);
++
++/**
++ * Sparsify a raw image: punch holes behind zero-filled regions so the file
++ * only consumes storage for actual data. Safe on filesystems without hole
++ * punching support (there it simply does nothing).
++ * @param path Path to the image file.
++ * @param reclaimed_out Optional: receives an estimate of bytes reclaimed.
++ * @return true on success.
++ */
++RVVM_PUBLIC bool rvvm_blk_image_sparsify(const char* path, uint64_t* reclaimed_out);
++
++
++
+ /**
+  * Tell drive head position
+  */
+diff --git a/src/core/rvvm_blk.c b/src/core/rvvm_blk.c
+index 9085e88..8693459 100644
+--- a/src/core/rvvm_blk.c
++++ b/src/core/rvvm_blk.c
+@@ -304,3 +304,112 @@ void* rvvm_blk_get_data(rvvm_blk_dev_t* blk)
+ }
+ 
+ POP_OPTIMIZATION_SIZE
++
++/*
++ * Sparse image tooling. Images are plain raw files; sparseness is provided
++ * by the host filesystem (sparse files on APFS/ext4/NTFS/...), so the
++ * tooling only needs truncate + hole punching.
++ */
++#define IMG_SCAN_BLOCK (1U << 20)
++
++RVVM_PUBLIC bool rvvm_blk_image_create(const char* path, uint64_t size)
++{
++    if (!path || !size) {
++        return false;
++    }
++    rvfile_t* file = rvopen(path, RVFILE_RW | RVFILE_CREAT);
++    if (!file) {
++        return false;
++    }
++    uint64_t old_size = rvfilesize(file);
++    bool ret;
++    if (old_size < size) {
++        // Sparse: only the file size is changed, no blocks are allocated
++        ret = rvtruncate(file, size);
++    } else {
++        ret = true;
++    }
++    rvclose(file);
++    return ret;
++}
++
++RVVM_PUBLIC bool rvvm_blk_image_resize(const char* path, uint64_t size)
++{
++    if (!path || !size) {
++        return false;
++    }
++    rvfile_t* file = rvopen(path, RVFILE_RW);
++    if (!file) {
++        return false;
++    }
++    bool ret = rvtruncate(file, size);
++    rvclose(file);
++    return ret;
++}
++
++static bool img_block_is_zero(const uint8_t* buf, size_t size)
++{
++    for (size_t i = 0; i < size; ++i) {
++        if (buf[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++RVVM_PUBLIC bool rvvm_blk_image_sparsify(const char* path, uint64_t* reclaimed_out)
++{
++    if (reclaimed_out) {
++        *reclaimed_out = 0;
++    }
++    if (!path) {
++        return false;
++    }
++    rvfile_t* file = rvopen(path, RVFILE_RW);
++    if (!file) {
++        return false;
++    }
++    uint64_t fsize = rvfilesize(file);
++    uint64_t reclaimed = 0;
++    uint8_t* buf = (uint8_t*)malloc(IMG_SCAN_BLOCK);
++    if (!buf) {
++        rvclose(file);
++        return false;
++    }
++
++    // Scan for zero blocks and punch holes behind them. Scanning in 1M
++    // blocks keeps memory usage bounded; zero runs across block boundaries
++    // are coalesced so we punch large holes in one go.
++    uint64_t run_start = 0;
++    bool in_zero_run = false;
++    for (uint64_t off = 0; off < fsize; off += IMG_SCAN_BLOCK) {
++        size_t chunk = (size_t)((fsize - off) < IMG_SCAN_BLOCK ? (fsize - off) : IMG_SCAN_BLOCK);
++        if (rvread(file, buf, chunk, off) != chunk) {
++            break;
++        }
++        bool zero = img_block_is_zero(buf, chunk);
++        if (zero && !in_zero_run) {
++            run_start = off;
++            in_zero_run = true;
++        } else if (!zero && in_zero_run) {
++            uint64_t run_len = off - run_start;
++            if (rvtrim(file, run_start, run_len)) {
++                reclaimed += run_len;
++            }
++            in_zero_run = false;
++        }
++    }
++    if (in_zero_run) {
++        uint64_t run_len = fsize - run_start;
++        if (rvtrim(file, run_start, run_len)) {
++            reclaimed += run_len;
++        }
++    }
++    safe_free(buf);
++    rvfsync(file);
++    rvclose(file);
++    if (reclaimed_out) {
++        *reclaimed_out = reclaimed;
++    }
++    return true;
++}
+diff --git a/src/main.c b/src/main.c
+index f96be95..f75a307 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -288,6 +288,53 @@ static int rvvm_cli_main(int argc, char** argv)
+         return 0;
+     }
+ 
++    // Image tooling: create / resize / sparsify raw disk images
++    {
++        const char* img_path = rvvm_getarg("img-create");
++        if (!img_path) {
++            img_path = rvvm_getarg("img-resize");
++        }
++        if (!img_path) {
++            img_path = rvvm_getarg("img-sparsify");
++        }
++        if (img_path) {
++            if (rvvm_has_arg("img-create")) {
++                uint64_t size = rvvm_getarg_size("size");
++                if (!size) {
++                    rvvm_error("Usage: rvvm -img-create <file> -size <bytes|K|M|G>");
++                    return 1;
++                }
++                if (!rvvm_blk_image_create(img_path, size)) {
++                    rvvm_error("Failed to create image \"%s\"", img_path);
++                    return 1;
++                }
++                rvvm_info("Created sparse image \"%s\" (%llu bytes)", img_path,
++                          (unsigned long long)size);
++            } else if (rvvm_has_arg("img-resize")) {
++                uint64_t size = rvvm_getarg_size("size");
++                if (!size) {
++                    rvvm_error("Usage: rvvm -img-resize <file> -size <bytes|K|M|G>");
++                    return 1;
++                }
++                if (!rvvm_blk_image_resize(img_path, size)) {
++                    rvvm_error("Failed to resize image \"%s\"", img_path);
++                    return 1;
++                }
++                rvvm_info("Resized image \"%s\" to %llu bytes", img_path,
++                          (unsigned long long)size);
++            } else {
++                uint64_t reclaimed = 0;
++                if (!rvvm_blk_image_sparsify(img_path, &reclaimed)) {
++                    rvvm_error("Failed to sparsify image \"%s\"", img_path);
++                    return 1;
++                }
++                rvvm_info("Sparsified image \"%s\", reclaimed %llu bytes", img_path,
++                          (unsigned long long)reclaimed);
++            }
++            return 0;
++        }
++    }
++
+     // Default machine parameters: 1 core, 256M ram, riscv64, 640x480 screen
+     size_t mem = rvvm_getarg_size("m");
+     if (!mem) {

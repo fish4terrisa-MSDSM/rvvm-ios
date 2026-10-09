@@ -1,0 +1,22 @@
+From d0894a2b9b7e93ed9a5c16a73d81d949aae42eb6 Mon Sep 17 00:00:00 2001
+From: ahdiotllfer <ahdiotllfer@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 09:31:06 +0000
+Subject: [PATCH] gui_rvvm: forward-declare kbd press/release helpers
+---
+ src/gui/gui_rvvm.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/gui/gui_rvvm.c b/src/gui/gui_rvvm.c
+index 7b28537..169675a 100644
+--- a/src/gui/gui_rvvm.c
++++ b/src/gui/gui_rvvm.c
+@@ -65,6 +65,9 @@ static void rvvm_gui_free(gui_window_t* win)
+     safe_free(rvvm);
+ }
+ 
++static void rvvm_gui_kbd_press(rvvm_window_t* rvvm, hid_key_t key);
++static void rvvm_gui_kbd_release(rvvm_window_t* rvvm, hid_key_t key);
++
+ static void rvvm_gui_on_close(gui_window_t* win)
+ {
+     rvvm_window_t* rvvm = gui_window_get_data(win);

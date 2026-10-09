@@ -1,0 +1,3 @@
+2799ffac4d5b306c3f86b4291b0603d3906673fa
+# Upstream LekKit/RVVM commit (staging branch) the patch series applies onto.
+# Keep in sync with RVVM_COMMIT in scripts/prepare-rvvm.sh

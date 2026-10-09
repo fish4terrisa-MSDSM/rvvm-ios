@@ -1,0 +1,117 @@
+From c66c290acc821bbc422b885870f7e45ac9e2a813 Mon Sep 17 00:00:00 2001
+From: ahdiotllfer <ahdiotllfer@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 09:31:06 +0000
+Subject: [PATCH] main: CLI wiring for virtio-fs shares and virtio-gpu (venus|2d)
+---
+ src/main.c | 63 +++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/src/main.c b/src/main.c
+index f75a307..a866e0c 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -23,6 +23,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ 
+ #include <util/feature_test.h>
+ 
++#include <string.h>
++
+ #include <rvvm/rvvm.h>
+ #include <rvvm/rvvm_blk.h>
+ #include <rvvm/rvvm_board.h>
+@@ -39,6 +41,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ #include <devices/ns16550a.h>
+ #include <devices/rtl8169.h>
+ #include <devices/sound-hda.h>
++#include <devices/virtio-fs.h>
++#include <devices/virtio-gpu.h>
+ 
+ #include <devices/tap_api.h>
+ 
+@@ -190,6 +194,10 @@ static void rvvm_print_help(void)
+         "    -vfio_pci   ...  PCI passthrough via VFIO (Example: 00:02.0), needs root\n"
+         "    -nvme       ...  Explicitly attach storage image as NVMe device\n"
+         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
++        "    -virtio-fs  ...  Attach virtio-fs shared directory (tag: share)\n"
++        "    -virtio_gpu ...  Use virtio-gpu paravirtual display (optionally WxH)\n"
++        "                    with optional 3D backend: venus[=libpath] (virglrenderer\n"
++        "                    + Vulkan/MoltenVK), or plain 2D via 2d\n"
+         "    -nogui           Disable display GUI\n"
+         "    -nogpu           Disable GPU\n"
+         "    -nosound         Disable sound support\n"
+@@ -273,6 +281,19 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
+                 if (!rvvm_pci_vfio_init(machine, arg_val, RVVM_PCI_ADDR_ANY)) {
+                     return false;
+                 }
++            } else if (rvvm_strcmp(arg_name, "virtio-fs") || rvvm_strcmp(arg_name, "virtio_fs")) {
++                char tag[64] = "share";
++                const char* dir = arg_val;
++                const char* colon = strchr(arg_val, ':');
++                if (colon && colon > arg_val && (size_t)(colon - arg_val) < sizeof(tag)) {
++                    memcpy(tag, arg_val, (size_t)(colon - arg_val));
++                    tag[colon - arg_val] = 0;
++                    dir = colon + 1;
++                }
++                if (!virtio_fs_init_auto(machine, tag, dir)) {
++                    rvvm_error("Failed to attach virtio-fs share \"%s\"", arg_val);
++                    return false;
++                }
+             }
+         }
+     }
+@@ -405,6 +426,40 @@ static int rvvm_cli_main(int argc, char** argv)
+         } else if (rvvm_has_arg("bochs_display")) {
+             gui_window_t* win = gui_rvvm_init(0x1000000UL, NULL, machine);
+             rvvm_bochs_display_init_auto(machine, gui_window_get_fbdev(win));
++        } else if (rvvm_has_arg("virtio_gpu") || rvvm_has_arg("virtio-gpu")) {
++            // virtio-gpu paravirtual display, optional resolution & venus backend
++            uint32_t gpu_w = 1280;
++            uint32_t gpu_h = 800;
++            const char* gpu_arg = rvvm_getarg("virtio_gpu");
++            if (!gpu_arg) {
++                gpu_arg = rvvm_getarg("virtio-gpu");
++            }
++            if (gpu_arg) {
++                size_t len = 0;
++                uint32_t w = str_to_uint_base(gpu_arg, &len, 10);
++                if (w && gpu_arg[len] == 'x') {
++                    uint32_t h = str_to_uint_base(gpu_arg + len + 1, NULL, 10);
++                    if (h) {
++                        gpu_w = w;
++                        gpu_h = h;
++                    }
++                }
++            }
++            gui_window_t* win = gui_rvvm_init(0, NULL, machine);
++            rvvm_fbdev_t* gpu_fbdev = gui_window_get_fbdev(win);
++            rvvm_mmio_dev_t* vgpu = virtio_gpu_init_auto(machine, gpu_fbdev, gpu_w, gpu_h);
++            if (vgpu && gpu_arg) {
++                // gpu=...:venus[=libpath] enables venus 3D via virglrenderer;
++                // gpu=...:2d (or anything else) keeps plain 2D.
++                const char* backend = strchr(gpu_arg, ':');
++                backend = backend ? backend + 1 : gpu_arg;
++                if (strstr(backend, "venus") && !strstr(backend, "2d")) {
++                    const char* eq = strchr(backend, '=');
++                    if (!virtio_gpu_init_venus(vgpu, eq ? eq + 1 : NULL, 0)) {
++                        rvvm_warn("virtio-gpu: continuing in 2D mode (no virglrenderer venus backend)");
++                    }
++                }
++            }
+         } else {
+             gui_window_t* win = gui_rvvm_init(0, NULL, machine);
+             rvvm_simplefb_init_auto(machine, gui_window_get_fbdev(win));
+@@ -453,7 +508,13 @@ static int rvvm_cli_main(int argc, char** argv)
+         rvvm_blk_set_size(snap_blk, 0);
+     }
+ 
+-    if (!rvvm_has_arg("noisolation")) {
++    bool isolate = !rvvm_has_arg("noisolation");
++    if (isolate && (rvvm_has_arg("virtio-fs") || rvvm_has_arg("virtio_fs"))) {
++        rvvm_warn("virtio-fs requires filesystem access, disabling isolation");
++        isolate = false;
++    }
++
++    if (isolate) {
+         // Preparations are done, isolate the process as much as possible
+         rvvm_restrict_process();
+     }
